@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lazetable"
+version = "0.1.0"
+description = "Lazy table runtime with parser-aware rows and artifact-oriented data access."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "OpenAI Codex + user workspace" },
+]
+keywords = [
+  "lazy-loading",
+  "dataset",
+  "table",
+  "parquet",
+  "parser",
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+  "numpy>=1.26.0",
+  "pyarrow>=17.0.0",
+  "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+torch = [
+  "torch>=2.1.0",
+]
+dev = [
+  "pytest>=8.3.0",
+  "ruff>=0.7.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lazetable"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--basetemp=.tmp_pytest"]
