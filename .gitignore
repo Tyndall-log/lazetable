@@ -2,5 +2,6 @@
 .pytest_cache/
 .ruff_cache/
 .tmp_pytest/
+.plans/
 __pycache__/
 *.pyc
