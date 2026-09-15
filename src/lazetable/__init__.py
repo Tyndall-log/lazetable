@@ -14,7 +14,9 @@ from .artifacts import (
     PayloadType,
     SourcePayloadRef,
     write_artifact,
+    write_lowered_artifact,
 )
+from .builds import BuildPolicy, BuildResult, WriterConfig
 from .core import (
     LazyTable,
     ParsedRow,
@@ -48,6 +50,8 @@ __all__ = [
     "ArtifactBuilderBase",
     "ExecutorConfig",
     "BatchCardinalityError",
+    "BuildPolicy",
+    "BuildResult",
     "BuildContextView",
     "DuplicateArtifactKeyError",
     "ExternalPayloadRef",
@@ -67,6 +71,7 @@ __all__ = [
     "ParsedRow",
     "RowViewManager",
     "SeedPlan",
+    "WriterConfig",
     "make_artifact_ref",
     "make_source_ref",
     "payload_columns_for",
@@ -76,4 +81,5 @@ __all__ = [
     "resolve_ref",
     "RowViewManager",
     "write_artifact",
+    "write_lowered_artifact",
 ]

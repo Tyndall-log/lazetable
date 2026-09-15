@@ -8,6 +8,7 @@ import pyarrow.parquet as pq
 from lazetable import (
     ArtifactBuilderBase,
     BatchCardinalityError,
+    BuildPolicy,
     DuplicateArtifactKeyError,
     ExecutorConfig,
     ExternalPayloadRef,
@@ -72,7 +73,9 @@ def test_write_artifact_lowers_payloads(tmp_path: Path) -> None:
 
 
 def test_resolve_ref_for_artifact_scheme() -> None:
-    context = ResolverContext(sandbox_registry=SandboxRegistry({}), artifact_roots={"toy@v1": r"C:\tmp\toy\v1"})
+    context = ResolverContext(
+        sandbox_registry=SandboxRegistry({}), artifact_roots={"toy@v1": r"C:\tmp\toy\v1"}
+    )
     path = resolve_ref("art://toy@v1/row-1/payload.json", context)
     assert str(path).endswith(r"toy\v1\row-1\payload.json")
 
@@ -116,20 +119,25 @@ class CopyTransform(ArtifactBuilderBase):
     artifact_version = "v1"
     unique_keys = [("id",)]
 
-    def prepare_table(self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None):
+    def prepare_table(
+        self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None
+    ):
         provided_rows = list((build_context or {}).get("input_rows") or [])
         return provided_rows
 
-    def transform_row(self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_row(
+        self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         return {"id": row["id"], "x2": int(row["x"]) * 2}
 
 
 def test_build_artifact_reference_path(tmp_path: Path) -> None:
     artifact = CopyTransform().build(
         storage_root=tmp_path,
+        policy=BuildPolicy(),
         build_context={"input_rows": [{"id": "a", "x": 2}, {"id": "b", "x": 5}]},
     )
-    table = pq.read_table(artifact.path / "manifest.parquet")
+    table = pq.read_table(artifact.table.path / "manifest.parquet")
     rows = table.to_pylist()
     assert rows == [{"id": "a", "x2": 4}, {"id": "b", "x2": 10}]
 
@@ -139,16 +147,25 @@ class QueuedTransform(ArtifactBuilderBase):
     artifact_version = "v1"
     unique_keys = [("source", "value")]
 
-    def prepare_table(self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None):
+    def prepare_table(
+        self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None
+    ):
         provided_rows = list((build_context or {}).get("input_rows") or [])
         return provided_rows
 
-    def transform_row(self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_row(
+        self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         # Reverse sleep order to ensure completion order differs from input order.
         time.sleep(0.01 * (3 - row_idx))
-        return [{"source": row["id"], "value": int(row["x"])}, {"source": row["id"], "value": int(row["x"]) + 10}]
+        return [
+            {"source": row["id"], "value": int(row["x"])},
+            {"source": row["id"], "value": int(row["x"]) + 10},
+        ]
 
-    def transform_batch(self, items, *, batch_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_batch(
+        self, items, *, batch_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         return [
             {
                 "batch_idx": batch_idx,
@@ -162,10 +179,13 @@ class QueuedTransform(ArtifactBuilderBase):
 def test_build_artifact_queued_pipeline_preserves_row_order(tmp_path: Path) -> None:
     artifact = QueuedTransform().build(
         storage_root=tmp_path,
-        build_context={"input_rows": [{"id": "a", "x": 1}, {"id": "b", "x": 2}, {"id": "c", "x": 3}]},
+        policy=BuildPolicy(),
+        build_context={
+            "input_rows": [{"id": "a", "x": 1}, {"id": "b", "x": 2}, {"id": "c", "x": 3}]
+        },
         executor_config=ExecutorConfig(row_workers=3, batch_size=2),
     )
-    rows = pq.read_table(artifact.path / "manifest.parquet").to_pylist()
+    rows = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()
     assert [(row["source"], row["value"]) for row in rows] == [
         ("a", 1),
         ("a", 11),
@@ -181,10 +201,13 @@ def test_build_artifact_queued_pipeline_preserves_row_order(tmp_path: Path) -> N
 def test_build_artifact_process_pipeline_preserves_row_order(tmp_path: Path) -> None:
     artifact = QueuedTransform().build(
         storage_root=tmp_path,
-        build_context={"input_rows": [{"id": "a", "x": 1}, {"id": "b", "x": 2}, {"id": "c", "x": 3}]},
+        policy=BuildPolicy(),
+        build_context={
+            "input_rows": [{"id": "a", "x": 1}, {"id": "b", "x": 2}, {"id": "c", "x": 3}]
+        },
         executor_config=ExecutorConfig(row_workers=2, batch_size=2, row_executor="process"),
     )
-    rows = pq.read_table(artifact.path / "manifest.parquet").to_pylist()
+    rows = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()
     assert [(row["source"], row["value"]) for row in rows] == [
         ("a", 1),
         ("a", 11),
@@ -202,14 +225,20 @@ class BadBatchTransform(ArtifactBuilderBase):
     artifact_version = "v1"
     unique_keys = [("id",)]
 
-    def prepare_table(self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None):
+    def prepare_table(
+        self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None
+    ):
         provided_rows = list((build_context or {}).get("input_rows") or [])
         return provided_rows
 
-    def transform_row(self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_row(
+        self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         return {"id": row["id"], "x": int(row["x"])}
 
-    def transform_batch(self, items, *, batch_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_batch(
+        self, items, *, batch_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         return items[:-1]
 
 
@@ -217,6 +246,7 @@ def test_transform_batch_cardinality_violation_raises(tmp_path: Path) -> None:
     try:
         BadBatchTransform().build(
             storage_root=tmp_path,
+            policy=BuildPolicy(),
             build_context={"input_rows": [{"id": "a", "x": 1}, {"id": "b", "x": 2}]},
             executor_config=ExecutorConfig(row_workers=1, batch_size=2),
         )
@@ -231,11 +261,15 @@ class DuplicateKeyTransform(ArtifactBuilderBase):
     artifact_version = "v1"
     unique_keys = [("id",)]
 
-    def prepare_table(self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None):
+    def prepare_table(
+        self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None
+    ):
         provided_rows = list((build_context or {}).get("input_rows") or [])
         return provided_rows
 
-    def transform_row(self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_row(
+        self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         return {"id": "dup", "x": int(row["x"])}
 
 
@@ -243,6 +277,7 @@ def test_duplicate_unique_key_raises(tmp_path: Path) -> None:
     try:
         DuplicateKeyTransform().build(
             storage_root=tmp_path,
+            policy=BuildPolicy(),
             build_context={"input_rows": [{"id": "a", "x": 1}, {"id": "b", "x": 2}]},
             executor_config=ExecutorConfig(row_workers=1),
         )
@@ -257,11 +292,15 @@ class ThreadRecordingTransform(ArtifactBuilderBase):
     artifact_version = "v1"
     unique_keys = [("id",)]
 
-    def prepare_table(self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None):
+    def prepare_table(
+        self, *, parent_rows=None, build_context=None, sandbox_registry=None, seed_plan=None
+    ):
         provided_rows = list((build_context or {}).get("input_rows") or [])
         return provided_rows
 
-    def transform_row(self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None):
+    def transform_row(
+        self, row, *, row_idx, parent_rows, build_context, sandbox_registry=None, seed_plan=None
+    ):
         import threading
 
         return {
@@ -273,18 +312,20 @@ class ThreadRecordingTransform(ArtifactBuilderBase):
 def test_row_workers_zero_runs_transform_row_on_main_thread(tmp_path: Path) -> None:
     artifact = ThreadRecordingTransform().build(
         storage_root=tmp_path,
+        policy=BuildPolicy(),
         build_context={"input_rows": [{"id": "a"}]},
         executor_config=ExecutorConfig(row_workers=0, batch_size=1, row_executor="thread"),
     )
-    row = pq.read_table(artifact.path / "manifest.parquet").to_pylist()[0]
+    row = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()[0]
     assert row["thread_name"] == "MainThread"
 
 
 def test_row_workers_one_runs_transform_row_on_worker_thread(tmp_path: Path) -> None:
     artifact = ThreadRecordingTransform().build(
         storage_root=tmp_path,
+        policy=BuildPolicy(),
         build_context={"input_rows": [{"id": "a"}]},
         executor_config=ExecutorConfig(row_workers=1, batch_size=1, row_executor="thread"),
     )
-    row = pq.read_table(artifact.path / "manifest.parquet").to_pylist()[0]
+    row = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()[0]
     assert row["thread_name"] != "MainThread"

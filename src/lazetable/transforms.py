@@ -2,16 +2,41 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Mapping, MutableMapping
-from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass
 from pathlib import Path
-import shutil
 from typing import Any
 
 from tqdm import tqdm
 
-from .artifacts import ArtifactDependency, INTERNAL_SOURCE_ROW_IDX, serialize_dependencies, write_artifact
+from .artifacts import (
+    ArtifactDependency,
+    ArtifactWriter,
+    INTERNAL_SOURCE_ROW_IDX,
+    serialize_dependencies,
+    write_lowered_artifact,
+)
+from .builds import (
+    BuildPolicy,
+    BuildResult,
+    StreamingArtifactWriter,
+    WriterConfig,
+    atomic_write_json,
+    build_signature,
+    completed_source_indices,
+    failed_source_indices,
+    read_lowered_rows,
+    reset_directory,
+)
 from .core import LazyTable, ParsedRow, SandboxRegistry
 
 MutableBuildContext = MutableMapping[str, Any]
@@ -144,7 +169,7 @@ class ArtifactBuilderBase:
     ) -> list[dict[str, Any]]:
         return [dict(item) for item in items]
 
-    def finalize_table(
+    def finalize_manifest(
         self,
         rows: list[dict[str, Any]],
         *,
@@ -155,91 +180,13 @@ class ArtifactBuilderBase:
     ) -> list[dict[str, Any]]:
         return rows
 
+    def signature_data(self, *, build_context: BuildContextView) -> dict[str, Any]:
+        """Builder가 build signature에 추가할 source fingerprint를 반환한다."""
+
+        return {}
+
     def artifact_dir(self, storage_root: Path) -> Path:
         return Path(storage_root) / self.artifact_name / self.artifact_version
-
-    def _build_to_directory(
-        self,
-        *,
-        parent_rows: list[ParsedRow],
-        out_dir: Path,
-        storage_root: Path,
-        seed_plan: SeedPlan | None = None,
-        transform_limit: int | None = None,
-        executor_config: ExecutorConfig,
-        build_context: MutableBuildContext,
-        sandbox_registry: SandboxRegistry | None,
-    ) -> LazyTable:
-        """Build an artifact via the staged transform contract."""
-
-        prepared_rows = self.prepare_table(
-            parent_rows=parent_rows,
-            build_context=build_context,
-            sandbox_registry=sandbox_registry,
-            seed_plan=seed_plan,
-        )
-        if transform_limit is not None:
-            prepared_rows = prepared_rows[: max(0, int(transform_limit))]
-        completed_source_rows: set[int] = set()
-
-        with tqdm(total=len(prepared_rows), desc="artifact_build", unit="row") as pbar:
-            def _progress_complete(row_idx: int) -> None:
-                if row_idx in completed_source_rows:
-                    return
-                completed_source_rows.add(int(row_idx))
-                pbar.update(1)
-
-            out_rows = _run_row_batch_pipeline(
-                self,
-                prepared_rows,
-                parent_rows=parent_rows,
-                build_context=build_context,
-                sandbox_registry=sandbox_registry,
-                seed_plan=seed_plan,
-                executor_config=executor_config,
-                row_completed_callback=_progress_complete,
-            )
-
-            out_rows = self.finalize_table(
-                out_rows,
-                parent_rows=parent_rows,
-                build_context=build_context,
-                sandbox_registry=sandbox_registry,
-                seed_plan=seed_plan,
-            )
-
-            result = write_artifact(
-                artifact_name=str(self.artifact_name),
-                artifact_version=str(self.artifact_version),
-                rows=out_rows,
-                out_dir=out_dir,
-                table_meta={},
-                meta={
-                    "dependencies": serialize_dependencies(self.dependencies),
-                },
-                artifact_roots={"default": str(storage_root)},
-                row_written_callback=_progress_complete,
-                unique_key_fields=self.primary_unique_key(),
-            )
-            if pbar.n < pbar.total:
-                remaining = [idx for idx in range(len(prepared_rows)) if idx not in completed_source_rows]
-                if remaining:
-                    pbar.update(len(remaining))
-            if sandbox_registry is not None:
-                return LazyTable.from_table(
-                    result.table.table,
-                    artifact_id=result.table.artifact_id,
-                    path=result.table.path,
-                    meta=result.table.meta,
-                    payload_manager=result.table._payload_manager,  # type: ignore[attr-defined]
-                    row_view_manager=result.table._row_view_manager,  # type: ignore[attr-defined]
-                    resolver_context=result.table.resolver_context.__class__(
-                        sandbox_registry=sandbox_registry,
-                        artifact_roots=result.table.resolver_context.artifact_roots,
-                    ),
-                    context=result.table.context,
-                )
-        return result.table
 
     def build(
         self,
@@ -248,42 +195,191 @@ class ArtifactBuilderBase:
         parent_tables: list[LazyTable] | None = None,
         build_context: MutableBuildContext | None = None,
         sandbox_registry: SandboxRegistry | None = None,
-        overwrite: bool = False,
+        policy: BuildPolicy,
         seed_plan: SeedPlan | None = None,
         transform_limit: int | None = None,
-        batch_size: int | None = None,
         executor_config: ExecutorConfig | None = None,
-    ) -> LazyTable:
+        writer_config: WriterConfig | None = None,
+    ) -> BuildResult:
         self.validate_definition()
         self.validate_sandbox_registry(sandbox_registry)
         storage_root_path = Path(storage_root)
         out_dir = self.artifact_dir(storage_root_path)
-        if out_dir.exists():
-            if not overwrite:
-                raise FileExistsError(f"artifact already exists: {out_dir}")
-            shutil.rmtree(out_dir)
+        staging_dir = out_dir.with_name(f".{out_dir.name}.building")
         parent_tables_list = list(parent_tables or [])
         parent_rows: list[ParsedRow] = []
         for table in parent_tables_list:
             parent_rows.extend(list(table))
+        context = dict(build_context or {})
         cfg = executor_config or self.executor_config
-        if batch_size is not None and int(batch_size) != cfg.batch_size:
-            cfg = ExecutorConfig(
-                row_workers=cfg.row_workers,
-                batch_size=int(batch_size),
-                max_inflight=cfg.max_inflight,
-                row_executor=cfg.row_executor,
-            )
-        return self._build_to_directory(
-            parent_rows=parent_rows,
-            out_dir=out_dir,
-            storage_root=storage_root_path,
+        signature, signature_payload = build_signature(
+            builder=self,
+            build_context=context,
+            parent_tables=parent_tables_list,
             seed_plan=seed_plan,
-            transform_limit=transform_limit,
-            executor_config=cfg,
-            build_context=dict(build_context or {}),
-            sandbox_registry=sandbox_registry,
+            runtime_parameters={
+                "transform_limit": transform_limit,
+                "executor_config": {
+                    "row_workers": cfg.row_workers,
+                    "batch_size": cfg.batch_size,
+                    "max_inflight": cfg.max_inflight,
+                    "row_executor": cfg.row_executor,
+                },
+            },
         )
+        if out_dir.exists():
+            meta_path = out_dir / "meta.json"
+            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            if policy.reuse_completed:
+                if meta.get("build_signature") != signature:
+                    raise ValueError(f"completed artifact signature mismatch: {out_dir}")
+                return BuildResult(
+                    table=LazyTable.open(out_dir, sandbox_registry=sandbox_registry),
+                    status="reused",
+                    processed_source_rows=0,
+                    skipped_source_rows=int(meta.get("source_row_count", 0)),
+                    failed_source_rows=0,
+                )
+            reset_directory(out_dir)
+            out_dir.rmdir()
+
+        state_dir = staging_dir / ".lazetable-build"
+        build_state_path = state_dir / "build.json"
+        if staging_dir.exists():
+            state = (
+                json.loads(build_state_path.read_text(encoding="utf-8"))
+                if build_state_path.exists()
+                else {}
+            )
+            if policy.resume_partial and state.get("build_signature") != signature:
+                raise ValueError(f"partial artifact signature mismatch: {staging_dir}")
+            if not policy.resume_partial:
+                reset_directory(staging_dir)
+        else:
+            staging_dir.mkdir(parents=True)
+        atomic_write_json(
+            build_state_path,
+            {
+                "status": "building",
+                "build_signature": signature,
+                "signature_payload": signature_payload,
+            },
+        )
+
+        prepared_rows = self.prepare_table(
+            parent_rows=parent_rows,
+            build_context=context,
+            sandbox_registry=sandbox_registry,
+            seed_plan=seed_plan,
+        )
+        if transform_limit is not None:
+            prepared_rows = prepared_rows[: max(0, int(transform_limit))]
+        completed = completed_source_indices(state_dir)
+        failures = failed_source_indices(state_dir)
+        if failures and not policy.retry_failed:
+            raise RuntimeError(f"partial build contains failed source rows: {sorted(failures)}")
+        for failed_idx in failures:
+            failure_path = state_dir / "failures" / f"{failed_idx:012d}.json"
+            failure_path.unlink(missing_ok=True)
+
+        artifact_roots = {
+            "default": str(storage_root_path),
+            f"{self.artifact_name}@{self.artifact_version}": str(out_dir),
+        }
+        payload_writer = StreamingArtifactWriter(
+            writer=ArtifactWriter(
+                artifact_name=self.artifact_name,
+                artifact_version=self.artifact_version,
+                out_dir=staging_dir,
+                artifact_roots=artifact_roots,
+                unique_key_fields=self.primary_unique_key(),
+            ),
+            state_dir=state_dir,
+            config=writer_config or WriterConfig(),
+            completed_sources=completed,
+        )
+        processed: set[int] = set()
+        try:
+            with tqdm(
+                total=len(prepared_rows),
+                initial=len(completed),
+                desc="artifact_build",
+                unit="row",
+            ) as progress:
+
+                def emit(source_idx: int, output_idx: int, row: dict[str, Any]) -> None:
+                    payload_writer.submit(source_idx, output_idx, row)
+
+                def finish(source_idx: int) -> None:
+                    payload_writer.finish_source(source_idx)
+                    processed.add(source_idx)
+                    progress.update(1)
+
+                _run_streaming_pipeline(
+                    self,
+                    prepared_rows,
+                    parent_rows=parent_rows,
+                    build_context=context,
+                    sandbox_registry=sandbox_registry,
+                    seed_plan=seed_plan,
+                    executor_config=cfg,
+                    skip_source_indices=completed,
+                    emit=emit,
+                    finish_source=finish,
+                    fail_source=payload_writer.mark_failed,
+                )
+            payload_writer.close()
+        except BaseException:
+            try:
+                payload_writer.close()
+            except BaseException:
+                pass
+            raise
+
+        final_completed = completed_source_indices(state_dir)
+        if len(final_completed) != len(prepared_rows):
+            raise RuntimeError(
+                "build did not complete every source row: "
+                f"completed={len(final_completed)}, total={len(prepared_rows)}"
+            )
+        lowered_rows = read_lowered_rows(state_dir, final_completed)
+        lowered_rows = self.finalize_manifest(
+            lowered_rows,
+            parent_rows=parent_rows,
+            build_context=context,
+            sandbox_registry=sandbox_registry,
+            seed_plan=seed_plan,
+        )
+        write_lowered_artifact(
+            artifact_name=self.artifact_name,
+            artifact_version=self.artifact_version,
+            lowered_rows=lowered_rows,
+            out_dir=staging_dir,
+            meta={
+                "dependencies": serialize_dependencies(self.dependencies),
+                "build_signature": signature,
+                "source_row_count": len(prepared_rows),
+                "build_status": "completed",
+            },
+            artifact_roots=artifact_roots,
+        )
+        atomic_write_json(
+            build_state_path,
+            {
+                "status": "completed",
+                "build_signature": signature,
+                "signature_payload": signature_payload,
+            },
+        )
+        os.replace(staging_dir, out_dir)
+        return BuildResult(
+            table=LazyTable.open(out_dir, sandbox_registry=sandbox_registry),
+            status="resumed" if completed else "built",
+            processed_source_rows=len(processed),
+            skipped_source_rows=len(completed),
+            failed_source_rows=0,
+        )
+
 
 def _process_worker_transform_row(
     transform: ArtifactBuilderBase,
@@ -305,6 +401,209 @@ def _process_worker_transform_row(
     )
 
 
+_PROCESS_WORKER_CONTEXT: tuple[Any, ...] | None = None
+
+
+def _initialize_process_worker(
+    transform: ArtifactBuilderBase,
+    parent_rows: list[ParsedRow],
+    build_context: BuildContextView,
+    sandbox_registry: SandboxRegistry | None,
+    seed_plan: SeedPlan | None,
+) -> None:
+    global _PROCESS_WORKER_CONTEXT
+    _PROCESS_WORKER_CONTEXT = (
+        transform,
+        parent_rows,
+        build_context,
+        sandbox_registry,
+        seed_plan,
+    )
+
+
+def _process_initialized_row(row: dict[str, Any], row_idx: int) -> Any:
+    if _PROCESS_WORKER_CONTEXT is None:
+        raise RuntimeError("process worker context was not initialized")
+    transform, parent_rows, build_context, sandbox_registry, seed_plan = _PROCESS_WORKER_CONTEXT
+    return transform.transform_row(
+        row,
+        row_idx=row_idx,
+        parent_rows=parent_rows,
+        build_context=build_context,
+        sandbox_registry=sandbox_registry,
+        seed_plan=seed_plan,
+    )
+
+
+def _run_streaming_pipeline(
+    transform: ArtifactBuilderBase,
+    rows: list[dict[str, Any]],
+    *,
+    parent_rows: list[ParsedRow],
+    build_context: BuildContextView,
+    sandbox_registry: SandboxRegistry | None,
+    seed_plan: SeedPlan | None,
+    executor_config: ExecutorConfig,
+    skip_source_indices: set[int],
+    emit: Any,
+    finish_source: Any,
+    fail_source: Any,
+) -> None:
+    """변환 결과를 누적하지 않고 bounded writer로 전달한다."""
+
+    row_workers = int(executor_config.row_workers)
+    worker_pool_size = max(1, row_workers)
+    batch_size = max(1, int(executor_config.batch_size))
+    max_inflight = int(executor_config.max_inflight or max(worker_pool_size * 2, 1))
+    if executor_config.row_executor not in {"thread", "process"}:
+        raise ValueError("row_executor must be 'thread' or 'process'")
+
+    ready_items: list[dict[str, Any]] = []
+    remaining_by_source: dict[int, int] = {}
+    output_ordinal: dict[int, int] = {}
+    batch_idx = 0
+
+    def drain(*, flush: bool = False) -> None:
+        nonlocal batch_idx, ready_items
+        while len(ready_items) >= batch_size or (flush and ready_items):
+            current = ready_items[:batch_size]
+            ready_items = ready_items[len(current) :]
+            try:
+                batch_rows = transform.transform_batch(
+                    current,
+                    batch_idx=batch_idx,
+                    parent_rows=parent_rows,
+                    build_context=build_context,
+                    sandbox_registry=sandbox_registry,
+                    seed_plan=seed_plan,
+                )
+            except BaseException as exc:
+                for source_idx in {int(item[INTERNAL_SOURCE_ROW_IDX]) for item in current}:
+                    fail_source(source_idx, exc)
+                raise
+            if len(batch_rows) != len(current):
+                error = BatchCardinalityError(
+                    "transform_batch must preserve item cardinality exactly: "
+                    f"input={len(current)}, output={len(batch_rows)}, batch_idx={batch_idx}"
+                )
+                for source_idx in {int(item[INTERNAL_SOURCE_ROW_IDX]) for item in current}:
+                    fail_source(source_idx, error)
+                raise error
+            for original, result in zip(current, batch_rows, strict=True):
+                source_idx = int(original[INTERNAL_SOURCE_ROW_IDX])
+                normalized = _attach_source_row_idx(result, source_row_idx=source_idx)
+                ordinal = output_ordinal.get(source_idx, 0)
+                output_ordinal[source_idx] = ordinal + 1
+                emit(source_idx, ordinal, normalized)
+                remaining_by_source[source_idx] -= 1
+                if remaining_by_source[source_idx] == 0:
+                    finish_source(source_idx)
+            batch_idx += 1
+
+    def accept(source_idx: int, value: Any) -> None:
+        items = _normalize_stage_items(value, source_row_idx=source_idx)
+        remaining_by_source[source_idx] = len(items)
+        if not items:
+            finish_source(source_idx)
+            return
+        ready_items.extend(items)
+        drain()
+
+    if row_workers <= 0:
+        for source_idx, row in enumerate(rows):
+            if source_idx in skip_source_indices:
+                continue
+            try:
+                value = transform.transform_row(
+                    row,
+                    row_idx=source_idx,
+                    parent_rows=parent_rows,
+                    build_context=build_context,
+                    sandbox_registry=sandbox_registry,
+                    seed_plan=seed_plan,
+                )
+            except BaseException as exc:
+                fail_source(source_idx, exc)
+                raise
+            accept(source_idx, value)
+        drain(flush=True)
+        return
+
+    pending_by_row_idx: dict[int, Any] = {}
+    futures: dict[Future[Any], int] = {}
+    next_submit_idx = 0
+    next_release_idx = 0
+
+    def submit_next(pool: ThreadPoolExecutor | ProcessPoolExecutor) -> bool:
+        nonlocal next_submit_idx
+        while next_submit_idx < len(rows) and next_submit_idx in skip_source_indices:
+            next_submit_idx += 1
+        if next_submit_idx >= len(rows):
+            return False
+        source_idx = next_submit_idx
+        row = rows[source_idx]
+        if executor_config.row_executor == "thread":
+            future = pool.submit(
+                transform.transform_row,
+                row,
+                row_idx=source_idx,
+                parent_rows=parent_rows,
+                build_context=build_context,
+                sandbox_registry=sandbox_registry,
+                seed_plan=seed_plan,
+            )
+        else:
+            future = pool.submit(
+                _process_initialized_row,
+                row,
+                source_idx,
+            )
+        futures[future] = source_idx
+        next_submit_idx += 1
+        return True
+
+    def release_ready() -> None:
+        nonlocal next_release_idx
+        while next_release_idx < len(rows):
+            if next_release_idx in skip_source_indices:
+                next_release_idx += 1
+                continue
+            if next_release_idx not in pending_by_row_idx:
+                break
+            accept(next_release_idx, pending_by_row_idx.pop(next_release_idx))
+            next_release_idx += 1
+
+    if executor_config.row_executor == "thread":
+        pool = ThreadPoolExecutor(max_workers=worker_pool_size)
+    else:
+        pool = ProcessPoolExecutor(
+            max_workers=worker_pool_size,
+            initializer=_initialize_process_worker,
+            initargs=(
+                transform,
+                parent_rows,
+                build_context,
+                sandbox_registry,
+                seed_plan,
+            ),
+        )
+    with pool:
+        while len(futures) < max_inflight and submit_next(pool):
+            pass
+        while futures:
+            done, _ = wait(futures, return_when=FIRST_COMPLETED)
+            for future in done:
+                source_idx = futures.pop(future)
+                try:
+                    pending_by_row_idx[source_idx] = future.result()
+                except BaseException as exc:
+                    fail_source(source_idx, exc)
+                    raise
+            release_ready()
+            while len(futures) < max_inflight and submit_next(pool):
+                pass
+    release_ready()
+    drain(flush=True)
 
 
 def _run_row_batch_pipeline(

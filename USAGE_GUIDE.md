@@ -163,6 +163,59 @@ The current build path uses a single progress bar:
 - `total = len(prepared_rows)`
 - progress is counted by completed input rows
 
+## Build policy와 background writer
+
+0.2부터 모든 builder 실행은 `BuildPolicy`를 명시한다.
+
+```python
+from lazetable import BuildPolicy, ExecutorConfig, WriterConfig
+
+result = builder.build(
+    storage_root=storage_root,
+    parent_tables=[parent],
+    policy=BuildPolicy(
+        reuse_completed=True,
+        resume_partial=True,
+        retry_failed=True,
+    ),
+    executor_config=ExecutorConfig(row_workers=4, max_inflight=8),
+    writer_config=WriterConfig(payload_workers=2, max_pending_writes=8),
+)
+```
+
+- `reuse_completed`: signature가 같은 완성 artifact를 열고 전체 빌드를 건너뛴다.
+- `resume_partial`: 같은 signature의 `.building` artifact에서 완료 source row를 건너뛴다.
+- `retry_failed`: journal에 실패한 source row가 있으면 다시 실행한다.
+- `payload_workers`: main process 내부의 background 저장 thread 수다.
+- `max_pending_writes`: 메모리에 대기할 수 있는 최대 저장 작업 수이며 backpressure
+  상한이 된다.
+
+`BuildResult.status`는 `built`, `resumed`, `reused` 중 하나다. 실제 table은
+`BuildResult.table`에서 얻는다.
+
+Payload는 transform worker 안에서 저장하지 않는다. process worker에서 저장하면
+계산과 파일 생명주기가 결합되고 journal transaction을 중앙에서 보장하기 어렵기
+때문이다. 별도 writer process도 Windows에서 ndarray를 한 번 더 직렬화하므로 기본
+구현은 main process의 thread pool을 사용한다.
+
+빌드 디렉터리:
+
+```text
+artifact-name/
+├── .version.building/
+│   ├── payload/
+│   └── .lazetable-build/
+│       ├── build.json
+│       ├── rows/<source-index>/*.json
+│       ├── sources/<source-index>.json
+│       └── failures/<source-index>.json
+└── version/                    # 완성 후 atomic 전환
+    ├── manifest.parquet
+    ├── meta.json
+    ├── payload/
+    └── .lazetable-build/
+```
+
 ---
 
 ## Example 1: Define A Payload Type
@@ -249,7 +302,7 @@ print(row.payload_field)
 ```python
 from pathlib import Path
 
-from lazetable import ArtifactBuilderBase
+from lazetable import ArtifactBuilderBase, BuildPolicy
 
 
 class DoubleValueBuilder(ArtifactBuilderBase):
@@ -264,8 +317,9 @@ class DoubleValueBuilder(ArtifactBuilderBase):
         }
 
 
-artifact = DoubleValueBuilder().build(
+result = DoubleValueBuilder().build(
     storage_root=Path(r"C:\tmp"),
+    policy=BuildPolicy(),
     build_context={
         "input_rows": [
             {"id": "a", "value": 2},
@@ -273,6 +327,8 @@ artifact = DoubleValueBuilder().build(
         ]
     },
 )
+
+artifact = result.table
 ```
 
 ---
