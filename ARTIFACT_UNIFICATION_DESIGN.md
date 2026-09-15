@@ -1,5 +1,8 @@
 # Artifact Unification Design
 
+> 이 문서는 초기 Parquet 설계 기록이다. LazeTable 0.3의 정식 artifact 형식은
+> `artifact.sqlite + payload/`이며 현재 계약은 `README.md`와 `USAGE_GUIDE.md`를 따른다.
+
 ## Goal
 
 `lazetable`에서는 현재 작업 중인 `header`와 `preprocess`를 라이브러리 코어 개념에서

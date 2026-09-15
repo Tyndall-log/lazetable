@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -317,6 +318,23 @@ class SQLiteArtifactStore:
         finally:
             connection.close()
 
+    def completed_unique_keys(self) -> set[str]:
+        connection = self._connect(read_only=True)
+        try:
+            return {
+                str(row["unique_key"])
+                for row in connection.execute(
+                    """
+                    SELECT output.unique_key
+                    FROM raw_output_rows AS output
+                    JOIN source_rows AS source USING(source_idx)
+                    WHERE source.status='completed'
+                    """
+                )
+            }
+        finally:
+            connection.close()
+
     def clear_failure(self, source_idx: int) -> None:
         with self.transaction() as connection:
             connection.execute("DELETE FROM failures WHERE source_idx=?", (source_idx,))
@@ -457,6 +475,79 @@ class SQLiteArtifactStore:
             return result
         finally:
             connection.close()
+
+    def dependencies(self) -> list[dict[str, Any]]:
+        connection = self._connect(read_only=True, immutable=True)
+        try:
+            return [
+                {
+                    "artifact_name": row["artifact_name"],
+                    "artifact_version": row["artifact_version"],
+                    "manifest_hash": row["manifest_hash"],
+                    "join": _decode(row["join_json"], None),
+                }
+                for row in connection.execute("SELECT * FROM dependencies ORDER BY position")
+            ]
+        finally:
+            connection.close()
+
+    def referenced_payload_paths(self) -> set[str]:
+        connection = self._connect(read_only=True)
+        try:
+            return {
+                str(row["relative_path"])
+                for row in connection.execute("SELECT relative_path FROM payloads")
+                if str(row["relative_path"]).startswith("payload/")
+            }
+        finally:
+            connection.close()
+
+    def remove_orphan_payloads(self, artifact_dir: Path) -> int:
+        payload_root = artifact_dir / "payload"
+        if not payload_root.is_dir():
+            return 0
+        referenced = self.referenced_payload_paths()
+        removed = 0
+        for path in payload_root.rglob("*"):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(artifact_dir).as_posix()
+            if relative not in referenced:
+                path.unlink()
+                removed += 1
+        for directory in sorted(
+            (path for path in payload_root.rglob("*") if path.is_dir()),
+            key=lambda path: len(path.parts),
+            reverse=True,
+        ):
+            if not any(directory.iterdir()):
+                directory.rmdir()
+        return removed
+
+    def validate_payloads(self, artifact_dir: Path, *, verify_hash: bool = True) -> int:
+        connection = self._connect(read_only=True)
+        checked = 0
+        try:
+            for row in connection.execute(
+                "SELECT relative_path, size_bytes, sha256 FROM payloads "
+                "WHERE relative_path LIKE 'payload/%'"
+            ):
+                path = artifact_dir / row["relative_path"]
+                if not path.is_file():
+                    raise FileNotFoundError(f"payload is missing: {path}")
+                if int(row["size_bytes"]) != path.stat().st_size:
+                    raise ValueError(f"payload size mismatch: {path}")
+                if verify_hash:
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                    if digest.hexdigest() != row["sha256"]:
+                        raise ValueError(f"payload hash mismatch: {path}")
+                checked += 1
+        finally:
+            connection.close()
+        return checked
 
     def checkpoint_and_close(self) -> None:
         connection = self._connect()

@@ -85,3 +85,35 @@ def test_multiple_readers_can_open_completed_store(tmp_path: Path) -> None:
 
     assert SQLiteArtifactStore(store.path).final_rows() == [{"__unique_key__": ["a"], "id": "a"}]
     assert SQLiteArtifactStore(store.path).final_rows() == [{"__unique_key__": ["a"], "id": "a"}]
+
+
+def test_orphan_cleanup_removes_unreferenced_payload(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    payload_dir = tmp_path / "payload"
+    payload_dir.mkdir()
+    orphan = payload_dir / "orphan.bin"
+    orphan.write_bytes(b"orphan")
+
+    assert store.remove_orphan_payloads(tmp_path) == 1
+    assert not orphan.exists()
+
+
+def test_payload_validation_detects_corruption(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    payload = tmp_path / "payload" / "data.bin"
+    payload.parent.mkdir()
+    payload.write_bytes(b"actual")
+    store.commit_source(
+        0,
+        [
+            (
+                0,
+                '["a"]',
+                {"id": "a"},
+                [PayloadRecord("data", "binary", "payload/data.bin", "present", 6, "wrong")],
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        store.validate_payloads(tmp_path)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Mapping, MutableMapping
 from concurrent.futures import (
@@ -23,21 +22,18 @@ from .artifacts import (
     ArtifactWriter,
     INTERNAL_SOURCE_ROW_IDX,
     serialize_dependencies,
-    write_lowered_artifact,
 )
 from .builds import (
     BuildPolicy,
     BuildResult,
     StreamingArtifactWriter,
     WriterConfig,
-    atomic_write_json,
     build_signature,
-    completed_source_indices,
-    failed_source_indices,
-    read_lowered_rows,
     reset_directory,
+    stable_hash,
 )
 from .core import LazyTable, ParsedRow, SandboxRegistry
+from .sqlite_store import SQLiteArtifactStore
 
 MutableBuildContext = MutableMapping[str, Any]
 BuildContextView = Mapping[str, Any]
@@ -76,6 +72,13 @@ class ExecutorConfig:
     batch_size: int = 32
     max_inflight: int | None = None
     row_executor: str = "process"
+
+
+@dataclass(frozen=True)
+class FinalizeResult:
+    rows: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    statistics: dict[str, dict[str, Any]]
 
 
 class ArtifactBuilderBase:
@@ -177,8 +180,8 @@ class ArtifactBuilderBase:
         build_context: MutableBuildContext,
         sandbox_registry: SandboxRegistry | None,
         seed_plan: SeedPlan | None = None,
-    ) -> list[dict[str, Any]]:
-        return rows
+    ) -> FinalizeResult:
+        return FinalizeResult(rows=rows, metadata={}, statistics={})
 
     def signature_data(self, *, build_context: BuildContextView) -> dict[str, Any]:
         """Builder가 build signature에 추가할 source fingerprint를 반환한다."""
@@ -228,42 +231,54 @@ class ArtifactBuilderBase:
             },
         )
         if out_dir.exists():
-            meta_path = out_dir / "meta.json"
-            meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+            completed_store = SQLiteArtifactStore(out_dir / "artifact.sqlite")
+            completed_store.validate_schema(read_only=True)
+            artifact = completed_store.artifact(read_only=True)
+            if artifact is None or artifact.status != "completed":
+                raise ValueError(f"completed artifact metadata is invalid: {out_dir}")
             if policy.reuse_completed:
-                if meta.get("build_signature") != signature:
+                if artifact.build_signature != signature:
                     raise ValueError(f"completed artifact signature mismatch: {out_dir}")
                 return BuildResult(
                     table=LazyTable.open(out_dir, sandbox_registry=sandbox_registry),
                     status="reused",
                     processed_source_rows=0,
-                    skipped_source_rows=int(meta.get("source_row_count", 0)),
+                    skipped_source_rows=artifact.source_row_count,
                     failed_source_rows=0,
                 )
             reset_directory(out_dir)
             out_dir.rmdir()
 
-        state_dir = staging_dir / ".lazetable-build"
-        build_state_path = state_dir / "build.json"
         if staging_dir.exists():
-            state = (
-                json.loads(build_state_path.read_text(encoding="utf-8"))
-                if build_state_path.exists()
-                else {}
-            )
-            if policy.resume_partial and state.get("build_signature") != signature:
-                raise ValueError(f"partial artifact signature mismatch: {staging_dir}")
-            if not policy.resume_partial:
+            if policy.resume_partial:
+                partial_store = SQLiteArtifactStore(staging_dir / "artifact.sqlite")
+                partial_store.validate_schema()
+                artifact = partial_store.artifact()
+                if artifact is None or artifact.build_signature != signature:
+                    raise ValueError(f"partial artifact signature mismatch: {staging_dir}")
+            else:
                 reset_directory(staging_dir)
         else:
             staging_dir.mkdir(parents=True)
-        atomic_write_json(
-            build_state_path,
-            {
-                "status": "building",
-                "build_signature": signature,
-                "signature_payload": signature_payload,
-            },
+
+        store = SQLiteArtifactStore(staging_dir / "artifact.sqlite")
+        dependency_records = []
+        for position, dependency in enumerate(serialize_dependencies(self.dependencies)):
+            parent_hash = None
+            if position < len(parent_tables_list):
+                parent = parent_tables_list[position]
+                if parent.path is not None:
+                    parent_artifact = SQLiteArtifactStore(parent.path / "artifact.sqlite").artifact(
+                        read_only=True
+                    )
+                    parent_hash = None if parent_artifact is None else parent_artifact.content_hash
+            dependency_records.append({**dependency, "manifest_hash": parent_hash})
+        store.initialize_build(
+            artifact_name=self.artifact_name,
+            artifact_version=self.artifact_version,
+            build_signature=signature,
+            signature_payload=signature_payload,
+            dependencies=dependency_records,
         )
 
         prepared_rows = self.prepare_table(
@@ -274,13 +289,14 @@ class ArtifactBuilderBase:
         )
         if transform_limit is not None:
             prepared_rows = prepared_rows[: max(0, int(transform_limit))]
-        completed = completed_source_indices(state_dir)
-        failures = failed_source_indices(state_dir)
+        store.ensure_source_rows(len(prepared_rows))
+        store.remove_orphan_payloads(staging_dir)
+        completed = store.completed_sources()
+        failures = store.failed_sources()
         if failures and not policy.retry_failed:
             raise RuntimeError(f"partial build contains failed source rows: {sorted(failures)}")
         for failed_idx in failures:
-            failure_path = state_dir / "failures" / f"{failed_idx:012d}.json"
-            failure_path.unlink(missing_ok=True)
+            store.clear_failure(failed_idx)
 
         artifact_roots = {
             "default": str(storage_root_path),
@@ -294,9 +310,8 @@ class ArtifactBuilderBase:
                 artifact_roots=artifact_roots,
                 unique_key_fields=self.primary_unique_key(),
             ),
-            state_dir=state_dir,
+            store=store,
             config=writer_config or WriterConfig(),
-            completed_sources=completed,
         )
         processed: set[int] = set()
         try:
@@ -336,41 +351,53 @@ class ArtifactBuilderBase:
                 pass
             raise
 
-        final_completed = completed_source_indices(state_dir)
+        final_completed = store.completed_sources()
         if len(final_completed) != len(prepared_rows):
             raise RuntimeError(
                 "build did not complete every source row: "
                 f"completed={len(final_completed)}, total={len(prepared_rows)}"
             )
-        lowered_rows = read_lowered_rows(state_dir, final_completed)
-        lowered_rows = self.finalize_manifest(
-            lowered_rows,
+        store.set_phase("finalizing")
+        finalize_result = self.finalize_manifest(
+            store.raw_rows(),
             parent_rows=parent_rows,
             build_context=context,
             sandbox_registry=sandbox_registry,
             seed_plan=seed_plan,
         )
-        write_lowered_artifact(
-            artifact_name=self.artifact_name,
-            artifact_version=self.artifact_version,
-            lowered_rows=lowered_rows,
-            out_dir=staging_dir,
-            meta={
+        rows_with_keys = []
+        for row in finalize_result.rows:
+            keyed = dict(row)
+            keyed["__unique_key__"] = [keyed[field] for field in self.primary_unique_key()]
+            rows_with_keys.append(keyed)
+        store.set_phase("validating")
+        store.validate_payloads(staging_dir, verify_hash=True)
+        for position, parent in enumerate(parent_tables_list):
+            if parent.path is None or position >= len(dependency_records):
+                continue
+            parent_artifact = SQLiteArtifactStore(parent.path / "artifact.sqlite").artifact(
+                read_only=True
+            )
+            expected_hash = dependency_records[position].get("manifest_hash")
+            actual_hash = None if parent_artifact is None else parent_artifact.content_hash
+            if parent_artifact is None or parent_artifact.status != "completed":
+                raise ValueError(f"parent artifact is not completed: {parent.path}")
+            if expected_hash != actual_hash:
+                raise ValueError(f"parent artifact changed during build: {parent.path}")
+        content_hash = stable_hash(rows_with_keys)
+        store.set_phase("committing")
+        store.finalize(
+            rows=rows_with_keys,
+            metadata={
+                **finalize_result.metadata,
                 "dependencies": serialize_dependencies(self.dependencies),
+                "artifact_roots": artifact_roots,
                 "build_signature": signature,
-                "source_row_count": len(prepared_rows),
-                "build_status": "completed",
             },
-            artifact_roots=artifact_roots,
+            statistics=finalize_result.statistics,
+            content_hash=content_hash,
         )
-        atomic_write_json(
-            build_state_path,
-            {
-                "status": "completed",
-                "build_signature": signature,
-                "signature_payload": signature_payload,
-            },
-        )
+        store.checkpoint_and_close()
         os.replace(staging_dir, out_dir)
         return BuildResult(
             table=LazyTable.open(out_dir, sandbox_registry=sandbox_registry),

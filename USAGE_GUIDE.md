@@ -42,17 +42,14 @@ Every artifact uses the same layout:
 
 ```text
 <artifact_dir>/
-  manifest.parquet
-  meta.json
+  artifact.sqlite
   payload/
 ```
 
 Meaning:
 
-- `manifest.parquet`
-  - lightweight row table
-- `meta.json`
-  - artifact metadata
+- `artifact.sqlite`
+  - row metadata, payload ref, dependency, build journal, statistics
 - `payload/`
   - large payload files written outside the table
 
@@ -62,7 +59,7 @@ Meaning:
 
 ### `LazyTable`
 
-`LazyTable` reads a Parquet-backed artifact table and gives row access through
+`LazyTable` reads a SQLite-backed artifact table and gives row access through
 `ParsedRow`.
 
 Lazy payload fields are reconstructed from `[payload_*]field_name` metadata.
@@ -113,7 +110,7 @@ Main hook methods:
 2. `transform_row(...)`
 3. `transform_batch(...)`
 4. payload lowering + save
-5. `finalize_table(...)`
+5. `finalize_manifest(...)` → `FinalizeResult`
 
 ---
 
@@ -152,7 +149,7 @@ Use:
 
 - `prepare_table(...)`
 - `transform_row(...)`
-- `finalize_table(...)`
+- `finalize_manifest(...)`
 
 for filtering, expansion, or reduction.
 
@@ -165,7 +162,7 @@ The current build path uses a single progress bar:
 
 ## Build policy와 background writer
 
-0.2부터 모든 builder 실행은 `BuildPolicy`를 명시한다.
+0.3부터 모든 builder 실행은 `BuildPolicy`를 명시한다.
 
 ```python
 from lazetable import BuildPolicy, ExecutorConfig, WriterConfig
@@ -193,6 +190,25 @@ result = builder.build(
 `BuildResult.status`는 `built`, `resumed`, `reused` 중 하나다. 실제 table은
 `BuildResult.table`에서 얻는다.
 
+후처리는 `FinalizeResult`를 반환한다.
+
+```python
+from lazetable import FinalizeResult
+
+
+def finalize_manifest(self, rows, **kwargs):
+    valid_count = sum(bool(row["is_valid"]) for row in rows)
+    return FinalizeResult(
+        rows=rows,
+        metadata={"normalization": "unit-sphere"},
+        statistics={"rows": {"total": len(rows), "valid": valid_count}},
+    )
+```
+
+Transform 결과는 `raw_output_rows`에 그대로 남고, 후처리 결과와 통계는 하나의
+SQLite transaction으로 `final_output_rows`와 `statistics`에 기록된다. 후처리 중
+중단되면 raw output 전체에서 후처리를 다시 실행한다.
+
 Payload는 transform worker 안에서 저장하지 않는다. process worker에서 저장하면
 계산과 파일 생명주기가 결합되고 journal transaction을 중앙에서 보장하기 어렵기
 때문이다. 별도 writer process도 Windows에서 ndarray를 한 번 더 직렬화하므로 기본
@@ -204,16 +220,10 @@ Payload는 transform worker 안에서 저장하지 않는다. process worker에�
 artifact-name/
 ├── .version.building/
 │   ├── payload/
-│   └── .lazetable-build/
-│       ├── build.json
-│       ├── rows/<source-index>/*.json
-│       ├── sources/<source-index>.json
-│       └── failures/<source-index>.json
+│   └── artifact.sqlite
 └── version/                    # 완성 후 atomic 전환
-    ├── manifest.parquet
-    ├── meta.json
-    ├── payload/
-    └── .lazetable-build/
+    ├── artifact.sqlite
+    └── payload/
 ```
 
 ---
@@ -276,7 +286,7 @@ What happens:
 
 - the payload is written under `payload/id=row-1/`
 - the row is lowered into metadata form
-- `manifest.parquet` and `meta.json` are written
+- `artifact.sqlite`에 row metadata와 artifact metadata가 기록됨
 
 ---
 
@@ -286,7 +296,7 @@ What happens:
 from lazetable import LazyTable
 
 
-table = LazyTable.from_parquet(r"C:\tmp\toy\v1\manifest.parquet")
+table = LazyTable.open(r"C:\tmp\toy\v1")
 row = table.first_row()
 
 print(row.id)
@@ -294,6 +304,39 @@ print(row.payload_field)
 ```
 
 `row.payload_field` is loaded lazily from the payload file.
+
+## 학습용 DatasetIndex
+
+SQLite는 artifact 정본이지만 학습 epoch마다 query하지 않는다. 필요한 split과 필드를
+한 번 preload하여 `DatasetIndex`를 만든다.
+
+```python
+index = table.to_dataset_index(
+    where={"split": "train", "is_valid": True},
+    fields=["id", "fdi", "mesh", "sdf_pool"],
+)
+```
+
+Torch DataLoader protocol과 호환되는 wrapper:
+
+```python
+dataset = index.to_torch_dataset(sample_adapter)
+encoded_index = dataset.encode_index(10, epoch=3)
+sample = dataset[encoded_index]
+```
+
+`TorchDatasetAdapter` 자체는 torch를 import하지 않는다. 실제 DataLoader 통합을
+검증하거나 사용할 때만 `torch` extra를 설치한다.
+
+## Parquet export
+
+Parquet은 artifact 정본이 아니라 선택적 snapshot이다.
+
+```python
+table.export_parquet(Path(r"C:\tmp\exports\artifact.parquet"))
+```
+
+export는 원본 `artifact.sqlite`를 수정하지 않는다.
 
 ---
 

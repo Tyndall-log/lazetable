@@ -3,5 +3,6 @@
 .ruff_cache/
 .tmp_pytest/
 .plans/
+benchmarks/.data/
 __pycache__/
 *.pyc

@@ -1,5 +1,8 @@
 # Parent Auto-Join Design Draft
 
+> 이 문서의 `manifest.parquet` 및 `meta.json` 예시는 초기 설계 기록이다. LazeTable
+> 0.3에서는 동일 metadata를 `artifact.sqlite`에 저장한다.
+
 ## Goal
 
 Introduce explicit parent dependency metadata and optional automatic parent

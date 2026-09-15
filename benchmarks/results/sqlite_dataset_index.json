@@ -1,0 +1,10 @@
+{
+  "measured_at": "2026-09-15",
+  "row_count": 25000,
+  "train_row_count": 22500,
+  "sqlite_size_mib": 4.0625,
+  "open_seconds": 0.054214700001466554,
+  "dataset_index_seconds": 0.05147269999724813,
+  "random_iteration_seconds": 0.02731909999420168,
+  "random_rows_per_second": 823599.6063111704
+}

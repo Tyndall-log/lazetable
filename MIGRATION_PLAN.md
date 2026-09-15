@@ -1,5 +1,8 @@
 # LazeTable Migration Plan
 
+> 초기 migration 기록이다. LazeTable 0.3은 이전 Parquet artifact의 하위 호환을
+> 제공하지 않고 SQLite artifact를 표준으로 사용한다.
+
 ## Goal
 
 Extract the reusable data runtime from the current workspace into a generic

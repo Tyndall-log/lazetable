@@ -12,7 +12,6 @@ from typing import Any, Protocol
 
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.parquet as pq
 
 from .core import (
     ArtifactId,
@@ -159,7 +158,11 @@ class ArtifactStore:
         root = self.paths.artifact_roots[root_name]
         if artifact_version == "latest":
             base = root / artifact_name
-            candidates = [path for path in base.iterdir() if path.is_dir()] if base.exists() else []
+            candidates = (
+                [path for path in base.iterdir() if path.is_dir() and not path.name.startswith(".")]
+                if base.exists()
+                else []
+            )
             if not candidates:
                 raise FileNotFoundError(f"artifact not found: {artifact_name}@latest")
             artifact_dir = max(candidates, key=lambda path: path.stat().st_mtime)
@@ -182,28 +185,42 @@ def open_artifact(
     sandbox_registry: SandboxRegistry | None = None,
 ) -> LazyTable:
     artifact_dir = Path(path)
-    manifest_path = artifact_dir / "manifest.parquet"
-    meta_path = artifact_dir / "meta.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"manifest not found: {manifest_path}")
-    if not meta_path.exists():
-        raise FileNotFoundError(f"meta not found: {meta_path}")
-    manifest = pq.read_table(manifest_path)
-    meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    artifact_id = ArtifactId(
-        name=str(meta.get("artifact_name") or artifact_dir.parent.name),
-        version=str(meta.get("artifact_version") or artifact_dir.name),
-    )
-    table = _table_from_artifact_parts(
-        table=manifest,
-        artifact_id=artifact_id,
-        path=artifact_dir,
-        meta=meta,
-        sandbox_registry=sandbox_registry,
-    )
-    if not join_parents:
-        return table
-    return join_parent_tables(table, store=store, sandbox_registry=sandbox_registry)
+    sqlite_path = artifact_dir / "artifact.sqlite"
+    if sqlite_path.is_file():
+        from .sqlite_store import SQLITE_SCHEMA_VERSION, SQLiteArtifactStore
+
+        sqlite_store = SQLiteArtifactStore(sqlite_path)
+        sqlite_store.validate_schema(read_only=True)
+        stored = sqlite_store.artifact(read_only=True)
+        if stored is None or stored.status != "completed":
+            raise ValueError(f"artifact is not completed: {artifact_dir}")
+        rows = sqlite_store.final_rows()
+        columns = sorted({key for row in rows for key in row if key != "__unique_key__"})
+        normalized = [{key: row.get(key) for key in columns} for row in rows]
+        manifest = pa.Table.from_pylist(normalized)
+        meta = {
+            **stored.metadata,
+            "artifact_name": stored.artifact_name,
+            "artifact_version": stored.artifact_version,
+            "storage_format": "sqlite",
+            "storage_format_version": SQLITE_SCHEMA_VERSION,
+            "row_count": stored.output_row_count,
+            "content_hash": stored.content_hash,
+            "dependencies": sqlite_store.dependencies(),
+            "statistics": sqlite_store.statistics(),
+        }
+        artifact_id = ArtifactId(stored.artifact_name, stored.artifact_version)
+        table = _table_from_artifact_parts(
+            table=manifest,
+            artifact_id=artifact_id,
+            path=artifact_dir,
+            meta=meta,
+            sandbox_registry=sandbox_registry,
+        )
+        if not join_parents:
+            return table
+        return join_parent_tables(table, store=store, sandbox_registry=sandbox_registry)
+    raise FileNotFoundError(f"SQLite artifact not found: {sqlite_path}")
 
 
 @dataclass
@@ -321,6 +338,7 @@ class ArtifactWriter:
             f"[payload_ref]{field_name}": payload_ref,
             f"[payload_status]{field_name}": "present",
             f"[payload_sha256]{field_name}": digest.hexdigest(),
+            f"[payload_size_bytes]{field_name}": path.stat().st_size,
         }
         for meta_key, meta_value in extra_meta.items():
             lowered[f"[payload_{meta_key}]{field_name}"] = meta_value
@@ -409,42 +427,16 @@ def write_artifact(
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     lowered_rows = writer.write_payload_rows(rows, row_written_callback=row_written_callback)
-    manifest = pa.Table.from_pylist(lowered_rows)
-    schema_meta = {
-        "artifact_name": artifact_name,
-        "artifact_version": artifact_version,
-        "storage_format_version": LAZETABLE_STORAGE_FORMAT_VERSION,
-    }
-    if table_meta:
-        schema_meta.update(_normalize_metadata_dict(table_meta))
-    if effective_roots:
-        schema_meta["artifact_roots"] = effective_roots
-    encoded = {
-        str(key).encode("utf-8"): json.dumps(value, ensure_ascii=False).encode("utf-8")
-        for key, value in schema_meta.items()
-    }
-    manifest = manifest.replace_schema_metadata(encoded)
-    manifest_path = out_dir / "manifest.parquet"
-    pq.write_table(manifest, manifest_path, compression="zstd")
-    final_meta = {
-        "artifact_name": artifact_name,
-        "artifact_version": artifact_version,
-        "storage_format_version": LAZETABLE_STORAGE_FORMAT_VERSION,
-        "row_count": manifest.num_rows,
-        "artifact_roots": effective_roots,
-    }
-    if meta:
-        final_meta.update(_normalize_metadata_dict(meta))
-    meta_path = out_dir / "meta.json"
-    meta_path.write_text(json.dumps(final_meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    table = _table_from_artifact_parts(
-        table=manifest,
-        artifact_id=ArtifactId(artifact_name, artifact_version),
-        path=out_dir,
-        meta=final_meta,
-        sandbox_registry=None,
+    return write_lowered_artifact(
+        artifact_name=artifact_name,
+        artifact_version=artifact_version,
+        lowered_rows=lowered_rows,
+        out_dir=out_dir,
+        table_meta=table_meta,
+        meta=meta,
+        artifact_roots=effective_roots,
+        unique_key_fields=unique_key_fields,
     )
-    return ArtifactWriteResult(table=table, lowered_rows=lowered_rows)
 
 
 def write_lowered_artifact(
@@ -456,50 +448,85 @@ def write_lowered_artifact(
     table_meta: dict[str, Any] | None = None,
     meta: dict[str, Any] | None = None,
     artifact_roots: dict[str, str] | None = None,
+    unique_key_fields: tuple[str, ...] = (),
 ) -> ArtifactWriteResult:
-    """이미 payload가 저장된 lowered row로 manifest와 metadata만 기록한다."""
+    """이미 payload가 저장된 lowered row를 완성 SQLite artifact로 기록한다."""
+
+    from .sqlite_store import PayloadRecord, SQLiteArtifactStore
 
     effective_roots = dict(artifact_roots or {})
     effective_roots.setdefault(f"{artifact_name}@{artifact_version}", str(out_dir))
-    columns = sorted({key for row in lowered_rows for key in row})
-    normalized_rows = [{key: row.get(key) for key in columns} for row in lowered_rows]
-    manifest = pa.Table.from_pylist(normalized_rows)
-    schema_meta = {
-        "artifact_name": artifact_name,
-        "artifact_version": artifact_version,
-        "storage_format_version": LAZETABLE_STORAGE_FORMAT_VERSION,
-    }
-    if table_meta:
-        schema_meta.update(_normalize_metadata_dict(table_meta))
-    if effective_roots:
-        schema_meta["artifact_roots"] = effective_roots
-    encoded = {
-        str(key).encode("utf-8"): json.dumps(value, ensure_ascii=False).encode("utf-8")
-        for key, value in schema_meta.items()
-    }
-    manifest = manifest.replace_schema_metadata(encoded)
-    pq.write_table(manifest, out_dir / "manifest.parquet", compression="zstd")
+    normalized_rows = [_normalize_metadata_dict(row) for row in lowered_rows]
     final_meta = {
         "artifact_name": artifact_name,
         "artifact_version": artifact_version,
         "storage_format_version": LAZETABLE_STORAGE_FORMAT_VERSION,
-        "row_count": manifest.num_rows,
+        "row_count": len(normalized_rows),
         "artifact_roots": effective_roots,
     }
+    if table_meta:
+        final_meta.update(_normalize_metadata_dict(table_meta))
     if meta:
         final_meta.update(_normalize_metadata_dict(meta))
-    (out_dir / "meta.json").write_text(
-        json.dumps(final_meta, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    signature_payload = {
+        "artifact_name": artifact_name,
+        "artifact_version": artifact_version,
+        "rows": normalized_rows,
+    }
+    build_signature = hashlib.sha256(
+        json.dumps(signature_payload, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    store = SQLiteArtifactStore(out_dir / "artifact.sqlite")
+    store.initialize_build(
+        artifact_name=artifact_name,
+        artifact_version=artifact_version,
+        build_signature=build_signature,
+        signature_payload=signature_payload,
+        dependencies=list(final_meta.get("dependencies", [])),
     )
-    table = _table_from_artifact_parts(
-        table=manifest,
-        artifact_id=ArtifactId(artifact_name, artifact_version),
-        path=out_dir,
-        meta=final_meta,
-        sandbox_registry=None,
+    store.ensure_source_rows(len(normalized_rows))
+    final_rows: list[dict[str, Any]] = []
+    for row_idx, row in enumerate(normalized_rows):
+        key_values = [row[field] for field in unique_key_fields] if unique_key_fields else [row_idx]
+        unique_key = json.dumps(key_values, ensure_ascii=False, sort_keys=True)
+        payload_records: list[PayloadRecord] = []
+        for key, reference in row.items():
+            if not key.startswith("[payload_ref]") or reference is None:
+                continue
+            field = key[len("[payload_ref]") :]
+            raw_reference = str(reference)
+            marker = "/payload/"
+            relative_path = (
+                f"payload/{raw_reference.split(marker, 1)[1]}"
+                if raw_reference.startswith("art://") and marker in raw_reference
+                else raw_reference
+            )
+            payload_records.append(
+                PayloadRecord(
+                    field_name=field,
+                    payload_id=str(row.get(f"[payload_id]{field}") or ""),
+                    relative_path=relative_path,
+                    status=str(row.get(f"[payload_status]{field}") or "present"),
+                    size_bytes=int(row.get(f"[payload_size_bytes]{field}") or 0),
+                    sha256=str(row.get(f"[payload_sha256]{field}") or ""),
+                )
+            )
+        store.commit_source(row_idx, [(0, unique_key, row, payload_records)])
+        final_rows.append({**row, "__unique_key__": key_values})
+    content_hash = hashlib.sha256(
+        json.dumps(final_rows, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+    store.finalize(
+        rows=final_rows,
+        metadata=final_meta,
+        statistics={},
+        content_hash=content_hash,
     )
-    return ArtifactWriteResult(table=table, lowered_rows=lowered_rows)
+    store.checkpoint_and_close()
+    return ArtifactWriteResult(
+        table=open_artifact(out_dir),
+        lowered_rows=lowered_rows,
+    )
 
 
 def _normalize_metadata_value(value: Any) -> Any:
@@ -625,11 +652,16 @@ def _join_parent_child(
         child_on=child_on,
         parent_on=parent_on,
     )
+    joined_meta = child.meta
+    joined_meta["artifact_roots"] = {
+        **parent.resolver_context.artifact_roots,
+        **child.resolver_context.artifact_roots,
+    }
     return _table_from_artifact_parts(
         table=joined_manifest,
         artifact_id=child.artifact_id,
         path=child.path,
-        meta=child.meta,
+        meta=joined_meta,
         sandbox_registry=sandbox_registry or child.resolver_context.sandbox_registry,
     )
 

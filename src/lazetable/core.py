@@ -208,7 +208,7 @@ def infer_resolver_context(
     context: Mapping[str, Any] | None = None,
     sandbox_registry: SandboxRegistry | None = None,
 ) -> ResolverContext:
-    """Build a resolver context from explicit context, schema metadata, and meta.json."""
+    """명시적 context와 artifact metadata에서 resolver context를 구성한다."""
 
     schema_meta = _decode_schema_metadata(schema_metadata)
     merged_artifact_roots: dict[str, str] = {}
@@ -249,7 +249,9 @@ class ParsedRow:
         self._values = dict(values)
         self._payload_manager = payload_manager or DEFAULT_PAYLOAD_MANAGER
         self._row_view_manager = row_view_manager or DEFAULT_ROW_VIEW_MANAGER
-        self._resolver_context = resolver_context or ResolverContext(sandbox_registry=None, artifact_roots={})
+        self._resolver_context = resolver_context or ResolverContext(
+            sandbox_registry=None, artifact_roots={}
+        )
         self._context = dict(context or {})
         self._resolved_fields: dict[str, Any] = {}
         self._payload_meta = self._collect_payload_meta(self._values)
@@ -380,12 +382,10 @@ class ParsedRow:
         self._context = dict(state["_context"])
         self._resolved_fields = dict(state["_resolved_fields"])
         self._payload_meta = {
-            str(field): dict(meta)
-            for field, meta in dict(state["_payload_meta"]).items()
+            str(field): dict(meta) for field, meta in dict(state["_payload_meta"]).items()
         }
         self._row_view_meta = {
-            str(field): dict(meta)
-            for field, meta in dict(state["_row_view_meta"]).items()
+            str(field): dict(meta) for field, meta in dict(state["_row_view_meta"]).items()
         }
 
     def __getattr__(self, field: str) -> Any:
@@ -413,7 +413,9 @@ class LazyTable:
         self._meta = dict(meta or {})
         self._payload_manager = payload_manager or DEFAULT_PAYLOAD_MANAGER
         self._row_view_manager = row_view_manager or DEFAULT_ROW_VIEW_MANAGER
-        self._resolver_context = resolver_context or ResolverContext(sandbox_registry=None, artifact_roots={})
+        self._resolver_context = resolver_context or ResolverContext(
+            sandbox_registry=None, artifact_roots={}
+        )
         self._context = dict(context or {})
 
     @classmethod
@@ -573,7 +575,11 @@ class LazyTable:
             start = 0 if index.start is None else index.start
             stop = len(self) if index.stop is None else index.stop
             step = 1 if index.step is None else index.step
-            rows = self._table.to_pylist()[index] if step != 1 else self._table.slice(start, max(0, stop - start)).to_pylist()
+            rows = (
+                self._table.to_pylist()[index]
+                if step != 1
+                else self._table.slice(start, max(0, stop - start)).to_pylist()
+            )
             return LazyTable.from_table(
                 pa.Table.from_pylist(rows),
                 artifact_id=self._artifact_id,
@@ -601,6 +607,32 @@ class LazyTable:
         if len(self) == 0:
             raise IndexError("table is empty")
         return self[0]
+
+    def to_dataset_index(
+        self,
+        *,
+        where: Mapping[str, Any] | None = None,
+        fields: list[str] | None = None,
+    ):
+        from .datasets import DatasetIndex
+
+        return DatasetIndex.from_table(self, where=where, fields=fields)
+
+    def export_parquet(self, path: str | Path, *, compression: str = "zstd") -> Path:
+        """완성 SQLite artifact의 현재 logical table을 Parquet snapshot으로 내보낸다."""
+
+        import json
+
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        metadata = dict(self._table.schema.metadata or {})
+        metadata[b"lazetable_artifact_meta"] = json.dumps(
+            self._meta,
+            ensure_ascii=False,
+        ).encode("utf-8")
+        table = self._table.replace_schema_metadata(metadata)
+        pq.write_table(table, target, compression=compression)
+        return target
 
 
 def payload_columns_for(field_names: Iterable[str], all_columns: Iterable[str]) -> list[str]:

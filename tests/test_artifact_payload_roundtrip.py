@@ -3,8 +3,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pyarrow.parquet as pq
-
 from lazetable import (
     ArtifactBuilderBase,
     BatchCardinalityError,
@@ -63,11 +61,14 @@ def test_write_artifact_lowers_payloads(tmp_path: Path) -> None:
         unique_key_fields=("id",),
     )
     row = result.lowered_rows[0]
+    assert (out_dir / "artifact.sqlite").is_file()
+    assert not (out_dir / "manifest.parquet").exists()
+    assert not (out_dir / "meta.json").exists()
     assert row["[payload_id]payload_field"] == "json_payload_v1"
     assert row["[payload_status]payload_field"] == "present"
     assert row["[payload_ref]payload_field"].startswith("art://toy@v1/payload/id=row-1/")
 
-    table = LazyTable.from_parquet(out_dir / "manifest.parquet")
+    table = LazyTable.open(out_dir)
     loaded = table.first_row()
     assert loaded.payload_field == {"value": 3}
 
@@ -106,8 +107,8 @@ def test_write_artifact_allows_external_payload_ref(tmp_path: Path) -> None:
     row = result.lowered_rows[0]
     assert row["[payload_ref]payload_field"] == "src://demo/sample.json"
 
-    table = LazyTable.from_parquet(
-        out_dir / "manifest.parquet",
+    table = LazyTable.open(
+        out_dir,
         sandbox_registry=SandboxRegistry({"demo": src_root}),
     )
     loaded = table.first_row()
@@ -137,8 +138,7 @@ def test_build_artifact_reference_path(tmp_path: Path) -> None:
         policy=BuildPolicy(),
         build_context={"input_rows": [{"id": "a", "x": 2}, {"id": "b", "x": 5}]},
     )
-    table = pq.read_table(artifact.table.path / "manifest.parquet")
-    rows = table.to_pylist()
+    rows = artifact.table.table.to_pylist()
     assert rows == [{"id": "a", "x2": 4}, {"id": "b", "x2": 10}]
 
 
@@ -185,7 +185,7 @@ def test_build_artifact_queued_pipeline_preserves_row_order(tmp_path: Path) -> N
         },
         executor_config=ExecutorConfig(row_workers=3, batch_size=2),
     )
-    rows = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()
+    rows = artifact.table.table.to_pylist()
     assert [(row["source"], row["value"]) for row in rows] == [
         ("a", 1),
         ("a", 11),
@@ -207,7 +207,7 @@ def test_build_artifact_process_pipeline_preserves_row_order(tmp_path: Path) -> 
         },
         executor_config=ExecutorConfig(row_workers=2, batch_size=2, row_executor="process"),
     )
-    rows = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()
+    rows = artifact.table.table.to_pylist()
     assert [(row["source"], row["value"]) for row in rows] == [
         ("a", 1),
         ("a", 11),
@@ -316,7 +316,7 @@ def test_row_workers_zero_runs_transform_row_on_main_thread(tmp_path: Path) -> N
         build_context={"input_rows": [{"id": "a"}]},
         executor_config=ExecutorConfig(row_workers=0, batch_size=1, row_executor="thread"),
     )
-    row = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()[0]
+    row = artifact.table.table.to_pylist()[0]
     assert row["thread_name"] == "MainThread"
 
 
@@ -327,5 +327,5 @@ def test_row_workers_one_runs_transform_row_on_worker_thread(tmp_path: Path) -> 
         build_context={"input_rows": [{"id": "a"}]},
         executor_config=ExecutorConfig(row_workers=1, batch_size=1, row_executor="thread"),
     )
-    row = pq.read_table(artifact.table.path / "manifest.parquet").to_pylist()[0]
+    row = artifact.table.table.to_pylist()[0]
     assert row["thread_name"] != "MainThread"

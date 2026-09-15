@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lazetable"
-version = "0.2.0"
+version = "0.3.0"
 description = "Lazy table runtime with parser-aware rows and artifact-oriented data access."
 readme = "README.md"
 requires-python = ">=3.11"
