@@ -4,5 +4,6 @@
 .tmp_pytest/
 .plans/
 benchmarks/.data/
+dist/
 __pycache__/
 *.pyc

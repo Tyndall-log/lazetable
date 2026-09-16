@@ -73,7 +73,6 @@ __all__ = [
     "SandboxRegistry",
     "SandboxRoot",
     "SourcePayloadRef",
-    "ParsedRow",
     "RowViewManager",
     "SeedPlan",
     "SampleAdapter",
