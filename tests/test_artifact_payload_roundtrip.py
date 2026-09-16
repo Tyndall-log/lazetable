@@ -73,12 +73,14 @@ def test_write_artifact_lowers_payloads(tmp_path: Path) -> None:
     assert loaded.payload_field == {"value": 3}
 
 
-def test_resolve_ref_for_artifact_scheme() -> None:
+def test_resolve_ref_for_artifact_scheme(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "toy" / "v1"
     context = ResolverContext(
-        sandbox_registry=SandboxRegistry({}), artifact_roots={"toy@v1": r"C:\tmp\toy\v1"}
+        sandbox_registry=SandboxRegistry({}),
+        artifact_roots={"toy@v1": str(artifact_root)},
     )
     path = resolve_ref("art://toy@v1/row-1/payload.json", context)
-    assert str(path).endswith(r"toy\v1\row-1\payload.json")
+    assert path == artifact_root / "row-1" / "payload.json"
 
 
 def test_write_artifact_allows_external_payload_ref(tmp_path: Path) -> None:
