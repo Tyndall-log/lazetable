@@ -8,11 +8,36 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Iterator, Sequence
+from urllib.parse import quote
 
 
 SQLITE_SCHEMA_VERSION = 1
+
+
+def _sqlite_uri(path: PurePath, query: str) -> str:
+    """경로를 SQLite URI로 바꾼다.
+
+    UNC(``\\\\host\\share``)는 authority로 해석되지 않도록 빈 authority 뒤에 두고
+    (``file:////host/share``), Windows 확장 경로 접두사(``\\\\?\\``)는 제거한다.
+    ``?``, ``#``, ``%``와 비ASCII 문자는 percent-encoding한다.
+    """
+
+    raw = str(path)
+    if raw.startswith("\\\\?\\UNC\\"):
+        path = type(path)("\\\\" + raw[len("\\\\?\\UNC\\") :])
+    elif raw.startswith("\\\\?\\"):
+        path = type(path)(raw[len("\\\\?\\") :])
+    posix = path.as_posix()
+    encoded = quote(posix, safe="/:")
+    if posix.startswith("/"):
+        location = f"//{encoded}"
+    elif path.drive:
+        location = f"///{encoded}"
+    else:
+        location = encoded
+    return f"file:{location}?{query}"
 
 
 def _now() -> str:
@@ -56,11 +81,11 @@ class SQLiteArtifactStore:
 
     def _connect(self, *, read_only: bool = False, immutable: bool = False) -> sqlite3.Connection:
         if read_only:
-            suffix = "?mode=ro"
+            query = "mode=ro"
             if immutable:
-                suffix += "&immutable=1"
+                query += "&immutable=1"
             connection = sqlite3.connect(
-                f"file:{self.path.as_posix()}{suffix}",
+                _sqlite_uri(self.path, query),
                 uri=True,
                 timeout=30.0,
             )

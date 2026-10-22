@@ -6,6 +6,8 @@ import hashlib
 import json
 import os
 import uuid
+import warnings
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -16,6 +18,9 @@ import pyarrow.compute as pc
 from .core import (
     ArtifactId,
     LazyTable,
+    PathResolution,
+    ResolverContext,
+    RootOverrides,
     SandboxRegistry,
     SandboxRoot,
     infer_resolver_context,
@@ -39,6 +44,10 @@ class MissingArtifactKeyFieldError(ArtifactKeyError):
 
 class DuplicateArtifactKeyError(ArtifactKeyError):
     """Raised when output rows violate declared artifact uniqueness."""
+
+
+class ArtifactPathFallbackWarning(UserWarning):
+    """상대 위치에 artifact 디렉터리가 없어 저장된 절대 경로로 대체할 때 발생한다."""
 
 
 @dataclass(frozen=True)
@@ -133,7 +142,23 @@ class PayloadTypeBase:
 
 @dataclass(frozen=True)
 class ArtifactStorePaths:
+    """Store 루트와 이 store로 여는 artifact의 기본 경로 해석 규칙."""
+
     artifact_roots: dict[str, Path]
+    path_resolution: PathResolution = "relative"
+    root_overrides: RootOverrides | None = None
+
+
+def _normalize_root_overrides(overrides: RootOverrides | None, base: Path) -> dict[str, str]:
+    """상대 경로 override를 ``base`` 기준으로 결합해 절대 경로 문자열로 만든다."""
+
+    normalized: dict[str, str] = {}
+    for key, value in (overrides or {}).items():
+        path = Path(value)
+        if not path.is_absolute():
+            path = (base / path).resolve()
+        normalized[str(key)] = str(path)
+    return normalized
 
 
 class ArtifactStore:
@@ -146,6 +171,19 @@ class ArtifactStore:
     def artifact_root_map(self) -> dict[str, str]:
         return {name: str(path) for name, path in self.paths.artifact_roots.items()}
 
+    def merged_root_overrides(
+        self, root_overrides: RootOverrides | None = None, *, base: Path | None = None
+    ) -> dict[str, str]:
+        """Store 기본 override와 호출 override를 합친다.
+
+        호출 쪽이 키 단위로 우선한다. 상대 경로 값은 ``base``(생략 시 ``default`` 루트) 기준이다.
+        """
+
+        merged = {**(self.paths.root_overrides or {}), **(root_overrides or {})}
+        if base is None:
+            base = Path(self.paths.artifact_roots.get("default", Path.cwd()))
+        return _normalize_root_overrides(merged, base)
+
     def open(
         self,
         artifact_name: str,
@@ -154,8 +192,11 @@ class ArtifactStore:
         root_name: str = "default",
         join_parents: bool = False,
         sandbox_registry: SandboxRegistry | None = None,
+        path_resolution: PathResolution | None = None,
+        root_overrides: RootOverrides | None = None,
     ) -> LazyTable:
-        root = self.paths.artifact_roots[root_name]
+        root = Path(self.paths.artifact_roots[root_name])
+        overrides = self.merged_root_overrides(root_overrides, base=root)
         if artifact_version == "latest":
             base = root / artifact_name
             candidates = (
@@ -169,11 +210,14 @@ class ArtifactStore:
             artifact_version = artifact_dir.name
         else:
             artifact_dir = root / artifact_name / artifact_version
+        artifact_dir = Path(overrides.get(f"{artifact_name}@{artifact_version}", artifact_dir))
         return open_artifact(
             artifact_dir,
             store=self,
             join_parents=join_parents,
             sandbox_registry=sandbox_registry,
+            path_resolution=path_resolution or self.paths.path_resolution,
+            root_overrides=overrides,
         )
 
 
@@ -183,8 +227,31 @@ def open_artifact(
     store: ArtifactStore | None = None,
     join_parents: bool = False,
     sandbox_registry: SandboxRegistry | None = None,
+    path_resolution: PathResolution | None = None,
+    root_overrides: RootOverrides | None = None,
 ) -> LazyTable:
+    """완성 SQLite artifact를 연다.
+
+    ``path_resolution="relative"``(store가 없을 때의 기본값)는 payload ref를 실제로 연
+    artifact 디렉터리와 그 저장 루트 기준으로 해석하고, ``"absolute"``는 artifact에
+    저장된 ``artifact_roots``를 그대로 쓴다. ``root_overrides``(``"<name>@<version>"`` 또는
+    ``"default"`` → 경로)는 두 모드 모두에서 최우선이며, 상대 경로 값은 store 루트(store가
+    없으면 이 artifact의 저장 루트) 기준으로 결합한다. ``join_parents``로 여는 부모에도 같은
+    규칙을 전달한다.
+    """
+
     artifact_dir = Path(path)
+    resolution: PathResolution = path_resolution or (
+        store.paths.path_resolution if store is not None else "relative"
+    )
+    storage_root = artifact_dir.parent.parent
+    overrides = (
+        store.merged_root_overrides(
+            root_overrides, base=Path(store.paths.artifact_roots.get("default", storage_root))
+        )
+        if store is not None
+        else _normalize_root_overrides(root_overrides, storage_root)
+    )
     sqlite_path = artifact_dir / "artifact.sqlite"
     if sqlite_path.is_file():
         from .sqlite_store import SQLITE_SCHEMA_VERSION, SQLiteArtifactStore
@@ -216,10 +283,18 @@ def open_artifact(
             path=artifact_dir,
             meta=meta,
             sandbox_registry=sandbox_registry,
+            path_resolution=resolution,
+            root_overrides=overrides,
         )
         if not join_parents:
             return table
-        return join_parent_tables(table, store=store, sandbox_registry=sandbox_registry)
+        return join_parent_tables(
+            table,
+            store=store,
+            sandbox_registry=sandbox_registry,
+            path_resolution=resolution,
+            root_overrides=overrides,
+        )
     raise FileNotFoundError(f"SQLite artifact not found: {sqlite_path}")
 
 
@@ -581,10 +656,28 @@ def join_parent_tables(
     *,
     store: ArtifactStore | None = None,
     sandbox_registry: SandboxRegistry | None = None,
+    path_resolution: PathResolution | None = None,
+    root_overrides: RootOverrides | None = None,
 ) -> LazyTable:
+    """부모 artifact를 열어 child-wins 규칙으로 join한다.
+
+    ``path_resolution``과 ``root_overrides``를 생략하면 ``table``을 열 때 쓴 규칙을 따른다.
+    """
+
     dependency_payload = table.meta.get("dependencies")
     if not isinstance(dependency_payload, list) or not dependency_payload:
         return table
+
+    context = table.resolver_context
+    resolution: PathResolution = path_resolution or context.path_resolution
+    storage_root = table.path.parent.parent if table.path is not None else Path.cwd()
+    if store is not None:
+        added = store.merged_root_overrides(
+            root_overrides, base=Path(store.paths.artifact_roots.get("default", storage_root))
+        )
+    else:
+        added = _normalize_root_overrides(root_overrides, storage_root)
+    overrides = {**context.root_overrides, **added}
 
     current = table
     for dependency_meta in dependency_payload:
@@ -596,6 +689,8 @@ def join_parent_tables(
             table=table,
             store=store,
             sandbox_registry=sandbox_registry,
+            path_resolution=resolution,
+            root_overrides=overrides,
         )
         current = _join_parent_child(
             parent=parent, child=current, dependency=dependency, sandbox_registry=sandbox_registry
@@ -609,13 +704,30 @@ def _open_dependency_artifact(
     table: LazyTable,
     store: ArtifactStore | None,
     sandbox_registry: SandboxRegistry | None,
+    path_resolution: PathResolution = "absolute",
+    root_overrides: Mapping[str, str] | None = None,
 ) -> LazyTable:
+    overrides = dict(root_overrides or {})
+    options: dict[str, Any] = {
+        "join_parents": True,
+        "sandbox_registry": sandbox_registry,
+        "path_resolution": path_resolution,
+        "root_overrides": overrides,
+    }
+    namespace = f"{dependency.artifact_name}@{dependency.artifact_version}"
+    if namespace in overrides:
+        return open_artifact(overrides[namespace], store=store, **options)
     if store is not None:
-        return store.open(
-            dependency.artifact_name,
-            dependency.artifact_version,
-            join_parents=True,
-            sandbox_registry=sandbox_registry,
+        return store.open(dependency.artifact_name, dependency.artifact_version, **options)
+    if path_resolution == "relative" and table.path is not None:
+        storage_root = Path(overrides.get("default", table.path.parent.parent))
+        candidate = storage_root / dependency.artifact_name / dependency.artifact_version
+        if candidate.is_dir():
+            return open_artifact(candidate, **options)
+        warnings.warn(
+            f"부모 artifact {namespace}가 상대 위치 {candidate}에 없어 저장된 artifact_roots로 대체합니다",
+            ArtifactPathFallbackWarning,
+            stacklevel=2,
         )
 
     artifact_roots = table.meta.get("artifact_roots", {})
@@ -629,7 +741,7 @@ def _open_dependency_artifact(
             "default artifact root missing; cannot resolve dependency without store"
         )
     path = Path(str(default_root)) / dependency.artifact_name / dependency.artifact_version
-    return open_artifact(path, join_parents=True, sandbox_registry=sandbox_registry)
+    return open_artifact(path, **options)
 
 
 def _join_parent_child(
@@ -652,17 +764,26 @@ def _join_parent_child(
         child_on=child_on,
         parent_on=parent_on,
     )
-    joined_meta = child.meta
-    joined_meta["artifact_roots"] = {
+    child_context = child.resolver_context
+    joined_roots = {
         **parent.resolver_context.artifact_roots,
-        **child.resolver_context.artifact_roots,
+        **child_context.artifact_roots,
     }
-    return _table_from_artifact_parts(
-        table=joined_manifest,
+    joined_meta = child.meta
+    joined_meta["artifact_roots"] = joined_roots
+    # 부모와 자식의 root는 각자 열 때 이미 해석되었으므로 다시 추론하지 않는다.
+    return LazyTable.from_table(
+        joined_manifest,
         artifact_id=child.artifact_id,
         path=child.path,
         meta=joined_meta,
-        sandbox_registry=sandbox_registry or child.resolver_context.sandbox_registry,
+        resolver_context=ResolverContext(
+            sandbox_registry or child_context.sandbox_registry,
+            joined_roots,
+            child_context.path_resolution,
+            child_context.root_overrides,
+        ),
+        context=child.context,
     )
 
 
@@ -733,16 +854,28 @@ def _table_from_artifact_parts(
     path: Path,
     meta: dict[str, Any],
     sandbox_registry: SandboxRegistry | None,
+    path_resolution: PathResolution = "relative",
+    root_overrides: Mapping[str, str] | None = None,
 ) -> LazyTable:
     merged_context = {
         "artifact_root": str(path.parent.parent),
     }
-    resolver_context = infer_resolver_context(
+    stored = infer_resolver_context(
         schema_metadata=table.schema.metadata,
         artifact_meta=meta,
         context=merged_context,
         sandbox_registry=sandbox_registry,
     )
+    overrides = dict(root_overrides or {})
+    if path_resolution == "absolute":
+        roots = {**stored.artifact_roots, **overrides}
+    elif path_resolution == "relative":
+        roots = _relative_artifact_roots(
+            stored.artifact_roots, artifact_id=artifact_id, path=path, overrides=overrides
+        )
+    else:
+        raise ValueError(f"unknown path_resolution: {path_resolution!r}")
+    resolver_context = ResolverContext(stored.sandbox_registry, roots, path_resolution, overrides)
     return LazyTable.from_table(
         table,
         artifact_id=artifact_id,
@@ -751,3 +884,41 @@ def _table_from_artifact_parts(
         resolver_context=resolver_context,
         context=merged_context,
     )
+
+
+def _relative_artifact_roots(
+    stored_roots: Mapping[str, str],
+    *,
+    artifact_id: ArtifactId,
+    path: Path,
+    overrides: Mapping[str, str],
+) -> dict[str, str]:
+    """실제로 연 artifact 위치를 기준으로 namespace별 root를 다시 계산한다.
+
+    자기 namespace는 연 디렉터리, ``<name>@<version>`` 형식의 다른 namespace는 저장 루트
+    아래 ``<name>/<version>``으로 계산한다. 그 디렉터리가 없을 때만 저장된 절대 경로로
+    대체하고 경고한다. ``overrides``는 마지막에 덮어써 최우선으로 적용한다.
+    """
+
+    storage_root = Path(overrides.get("default", path.parent.parent))
+    roots: dict[str, str] = {"default": str(storage_root)}
+    for namespace, stored_dir in stored_roots.items():
+        if namespace in ("default", artifact_id.text) or namespace in overrides:
+            continue
+        name, at, version = namespace.rpartition("@")
+        if not at or not name:
+            roots[namespace] = stored_dir
+            continue
+        candidate = storage_root / name / version
+        if candidate.is_dir():
+            roots[namespace] = str(candidate)
+            continue
+        warnings.warn(
+            f"artifact {namespace}가 상대 위치 {candidate}에 없어 저장된 경로 {stored_dir}로 대체합니다",
+            ArtifactPathFallbackWarning,
+            stacklevel=3,
+        )
+        roots[namespace] = stored_dir
+    roots[artifact_id.text] = str(path)
+    roots.update(overrides)
+    return roots

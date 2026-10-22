@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from os import PathLike
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 
+PathResolution = Literal["relative", "absolute"]
+RootOverrides = Mapping[str, str | PathLike[str]]
 PAYLOAD_COL_RE = re.compile(r"^\[payload_(?P<meta>[^\]]+)\](?P<field>.+)$")
 ROW_VIEW_COL_RE = re.compile(r"^\[row_view_(?P<meta>[^\]]+)\](?P<field>.+)$")
 
@@ -78,10 +81,18 @@ class SandboxRegistry:
 
 @dataclass(frozen=True)
 class ResolverContext:
-    """Absolute-root mapping used for logical ref resolution."""
+    """Absolute-root mapping used for logical ref resolution.
+
+    ``path_resolution``과 ``root_overrides``는 이 context로 연 table이 나중에
+    ``join_parents``할 때 같은 규칙을 물려주기 위해 보관한다. ``relative``에서는
+    ``artifact_roots``에 없는 ``<name>@<version>`` namespace를 ``default`` 저장
+    루트 아래 ``<name>/<version>``으로 계산한다.
+    """
 
     sandbox_registry: SandboxRegistry | None
     artifact_roots: Mapping[str, str]
+    path_resolution: PathResolution = "absolute"
+    root_overrides: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -168,10 +179,13 @@ def resolve_ref(ref: str, context: ResolverContext) -> Path:
         namespace, sep, rel_path = payload.partition("/")
         if not sep:
             raise ValueError(f"invalid artifact ref: {ref}")
-        try:
-            root = context.artifact_roots[namespace]
-        except KeyError as exc:
-            raise KeyError(f"unknown artifact root namespace: {namespace}") from exc
+        root = context.artifact_roots.get(namespace)
+        if root is None:
+            name, at, version = namespace.rpartition("@")
+            default_root = context.artifact_roots.get("default")
+            if context.path_resolution != "relative" or not at or not name or not default_root:
+                raise KeyError(f"unknown artifact root namespace: {namespace}")
+            root = str(Path(default_root) / name / version)
         return Path(root).joinpath(*[part for part in rel_path.split("/") if part])
 
     return Path(raw)
@@ -488,10 +502,18 @@ class LazyTable:
         *,
         join_parents: bool = False,
         sandbox_registry: SandboxRegistry | None = None,
+        path_resolution: PathResolution | None = None,
+        root_overrides: RootOverrides | None = None,
     ) -> "LazyTable":
         from .artifacts import open_artifact
 
-        return open_artifact(path, join_parents=join_parents, sandbox_registry=sandbox_registry)
+        return open_artifact(
+            path,
+            join_parents=join_parents,
+            sandbox_registry=sandbox_registry,
+            path_resolution=path_resolution,
+            root_overrides=root_overrides,
+        )
 
     @property
     def table(self) -> pa.Table:
@@ -522,10 +544,18 @@ class LazyTable:
         *,
         sandbox_registry: SandboxRegistry | None = None,
         store: Any = None,
+        path_resolution: PathResolution | None = None,
+        root_overrides: RootOverrides | None = None,
     ) -> "LazyTable":
         from .artifacts import join_parent_tables
 
-        return join_parent_tables(self, store=store, sandbox_registry=sandbox_registry)
+        return join_parent_tables(
+            self,
+            store=store,
+            sandbox_registry=sandbox_registry,
+            path_resolution=path_resolution,
+            root_overrides=root_overrides,
+        )
 
     def count_rows(self) -> int:
         return self._table.num_rows

@@ -305,6 +305,26 @@ print(row.payload_field)
 
 `row.payload_field` is loaded lazily from the payload file.
 
+### Path resolution
+
+Payload refs are stored as `art://<name>@<version>/payload/...`. When an artifact is opened,
+each namespace is mapped to a directory in this order:
+
+1. `root_overrides` — `{"<name>@<version>" or "default": path}` passed to `open_artifact()`,
+   `LazyTable.open()`, `ArtifactStore.open()`, `LazyTable.join_parents()`, or set as a store
+   default in `ArtifactStorePaths`. Relative values are joined to the store root (or, without a
+   store, to the opened artifact's storage root) and resolved. Wins in both modes.
+2. `path_resolution="relative"` (default) — the opened artifact maps to the directory it was
+   opened from; other `<name>@<version>` namespaces map to `<storage root>/<name>/<version>`.
+3. The absolute `artifact_roots` stored in `artifact.sqlite` — used directly with
+   `path_resolution="absolute"` (0.3.x behavior), and in relative mode only when the relative
+   artifact directory does not exist, with an `ArtifactPathFallbackWarning`.
+
+Parents opened through `join_parents` use the same rule for both where the parent artifact is
+opened and how its payload refs resolve. A table remembers its rule, so a later
+`table.join_parents()` follows it. Read-only SQLite connections accept UNC paths
+(`\\host\share\...`, including `\\?\UNC\...`).
+
 ## 학습용 DatasetIndex
 
 SQLite는 artifact 정본이지만 학습 epoch마다 query하지 않는다. 필요한 split과 필드를

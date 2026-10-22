@@ -57,6 +57,37 @@ mesh = row.mesh  # payload는 이 시점에 로드됩니다.
 └── payload/
 ```
 
+### 위치가 바뀐 artifact와 UNC 경로
+
+payload 경로는 기본적으로 **실제로 연 artifact 위치 기준**으로 해석합니다. 그래서 artifact를
+다른 폴더, NAS UNC 경로(`\\host\share\...`) 또는 다른 운영체제의 경로로 옮겨도 metadata를
+고치지 않고 그대로 열 수 있습니다. 부모 artifact(`join_parents=True`)는 같은 저장 루트 아래
+`<name>/<version>`에서 찾습니다.
+
+```python
+from lazetable import ArtifactStore, ArtifactStorePaths, LazyTable
+
+# NAS로 옮긴 artifact를 그대로 연다.
+table = LazyTable.open(r"\\nas\share\artifacts\child\v1", join_parents=True)
+
+# 부모가 다른 위치에 있으면 namespace("<name>@<version>")로 위치를 지정한다.
+# 상대 경로 값은 store 루트(직접 열면 연 artifact의 저장 루트) 기준이다.
+store = ArtifactStore(
+    ArtifactStorePaths(
+        artifact_roots={"default": r"\\nas\share\artifacts"},
+        root_overrides={"parent@v1": r"D:\archive\parent-v1"},
+    )
+)
+table = store.open("child", "v1", join_parents=True)
+
+# 0.3.x처럼 artifact에 저장된 절대 경로를 그대로 쓰려면:
+table = LazyTable.open(r"C:\data\child\v1", path_resolution="absolute")
+```
+
+해석 우선순위는 `root_overrides` > 실제 위치 기준(`path_resolution="relative"`, 기본값) >
+저장된 `artifact_roots`입니다. 상대 위치에 artifact 디렉터리가 없을 때만 저장된 경로로
+대체하며 `ArtifactPathFallbackWarning`을 냅니다. artifact 파일 내용은 바꾸지 않습니다.
+
 ## 학습용 index
 
 ```python
