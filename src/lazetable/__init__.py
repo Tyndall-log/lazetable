@@ -34,6 +34,7 @@ from .core import (
     resolve_ref,
 )
 from .datasets import DatasetIndex, DatasetRecord, SampleAdapter, TorchDatasetAdapter
+from .pipeline import Node, NodeContext
 from .registry import register_parser, register_payload_type, register_row_view
 from .transforms import (
     ArtifactBuilderBase,
@@ -73,6 +74,8 @@ __all__ = [
     "PayloadTypeBase",
     "PayloadType",
     "MutableBuildContext",
+    "Node",
+    "NodeContext",
     "PathResolution",
     "ResolverContext",
     "RootOverrides",

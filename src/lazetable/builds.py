@@ -43,6 +43,7 @@ class BuildResult:
     processed_source_rows: int
     skipped_source_rows: int
     failed_source_rows: int
+    node_stats: dict[str, dict[str, Any]] | None = None
 
 
 def jsonable(value: Any) -> Any:

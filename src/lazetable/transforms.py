@@ -33,14 +33,11 @@ from .builds import (
     stable_hash,
 )
 from .core import LazyTable, ParsedRow, SandboxRegistry
+from .pipeline import BatchCardinalityError, Node, pipeline_signature, run_pipeline, validate_nodes
 from .sqlite_store import SQLiteArtifactStore
 
 MutableBuildContext = MutableMapping[str, Any]
 BuildContextView = Mapping[str, Any]
-
-
-class BatchCardinalityError(ValueError):
-    """Raised when transform_batch changes item cardinality."""
 
 
 class MissingSandboxKeyError(KeyError):
@@ -66,6 +63,9 @@ class ExecutorConfig:
     - `row_executor="process"` requires the transform object and its
       dependencies to be pickleable under the platform's multiprocessing
       start method.
+    - For a builder with `pipeline()`, `row_workers` and `row_executor` set the
+      CPU workers; `batch_size` and `max_inflight` are not used. GPU nodes always
+      run on one dedicated thread.
     """
 
     row_workers: int = 1
@@ -97,6 +97,8 @@ class ArtifactBuilderBase:
     - `unique_keys` is required and is treated as a declaration contract for
       artifact identity. Duplicate enforcement is intentionally deferred to the
       next implementation step.
+    - A builder may override `pipeline()` to stack CPU/GPU nodes instead of using
+      `transform_row` and `transform_batch`.
     """
 
     artifact_name: str = ""
@@ -147,6 +149,11 @@ class ArtifactBuilderBase:
         seed_plan: SeedPlan | None = None,
     ) -> list[dict[str, Any]]:
         return list(parent_rows or [])
+
+    def pipeline(self) -> list[Node] | None:
+        """CPU/GPU 노드 목록. None이면 ``transform_row``와 ``transform_batch``를 쓴다."""
+
+        return None
 
     def transform_row(
         self,
@@ -215,6 +222,9 @@ class ArtifactBuilderBase:
             parent_rows.extend(list(table))
         context = dict(build_context or {})
         cfg = executor_config or self.executor_config
+        nodes = self.pipeline()
+        if nodes is not None:
+            validate_nodes(nodes)
         signature, signature_payload = build_signature(
             builder=self,
             build_context=context,
@@ -228,7 +238,9 @@ class ArtifactBuilderBase:
                     "max_inflight": cfg.max_inflight,
                     "row_executor": cfg.row_executor,
                 },
-            },
+            }
+            if nodes is None
+            else {"transform_limit": transform_limit, "pipeline": pipeline_signature(nodes)},
         )
         if out_dir.exists():
             completed_store = SQLiteArtifactStore(out_dir / "artifact.sqlite")
@@ -314,6 +326,8 @@ class ArtifactBuilderBase:
             config=writer_config or WriterConfig(),
         )
         processed: set[int] = set()
+        node_stats = None
+        node_failures: dict[int, BaseException] = {}
         try:
             with tqdm(
                 total=len(prepared_rows),
@@ -330,19 +344,40 @@ class ArtifactBuilderBase:
                     processed.add(source_idx)
                     progress.update(1)
 
-                _run_streaming_pipeline(
-                    self,
-                    prepared_rows,
-                    parent_rows=parent_rows,
-                    build_context=context,
-                    sandbox_registry=sandbox_registry,
-                    seed_plan=seed_plan,
-                    executor_config=cfg,
-                    skip_source_indices=completed,
-                    emit=emit,
-                    finish_source=finish,
-                    fail_source=payload_writer.mark_failed,
-                )
+                def fail_node_row(source_idx: int, error: BaseException) -> None:
+                    payload_writer.mark_failed(source_idx, error)
+                    progress.update(1)
+
+                if nodes is None:
+                    _run_streaming_pipeline(
+                        self,
+                        prepared_rows,
+                        parent_rows=parent_rows,
+                        build_context=context,
+                        sandbox_registry=sandbox_registry,
+                        seed_plan=seed_plan,
+                        executor_config=cfg,
+                        skip_source_indices=completed,
+                        emit=emit,
+                        finish_source=finish,
+                        fail_source=payload_writer.mark_failed,
+                    )
+                else:
+                    node_stats, node_failures = run_pipeline(
+                        self,
+                        nodes,
+                        prepared_rows,
+                        parent_rows=parent_rows,
+                        build_context=context,
+                        sandbox_registry=sandbox_registry,
+                        seed_plan=seed_plan,
+                        cpu_workers=int(cfg.row_workers),
+                        cpu_executor=cfg.row_executor,
+                        skip_source_indices=completed,
+                        emit=emit,
+                        finish_source=finish,
+                        fail_source=fail_node_row,
+                    )
             payload_writer.close()
         except BaseException:
             try:
@@ -351,6 +386,12 @@ class ArtifactBuilderBase:
                 pass
             raise
 
+        if node_failures:
+            first = min(node_failures)
+            raise RuntimeError(
+                f"{len(node_failures)} source rows failed; first is row {first}: "
+                f"{type(node_failures[first]).__name__}: {node_failures[first]}"
+            )
         final_completed = store.completed_sources()
         if len(final_completed) != len(prepared_rows):
             raise RuntimeError(
@@ -405,6 +446,7 @@ class ArtifactBuilderBase:
             processed_source_rows=len(processed),
             skipped_source_rows=len(completed),
             failed_source_rows=0,
+            node_stats=node_stats,
         )
 
 

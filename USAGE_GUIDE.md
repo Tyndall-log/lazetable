@@ -138,6 +138,41 @@ The first declared key is currently treated as the primary key for:
 - deterministic row id generation
 - payload directory naming
 
+### Stacking CPU/GPU Nodes With `pipeline()`
+
+Instead of `transform_row` and `transform_batch`, a builder can return a list of nodes.
+
+```python
+from lazetable import ArtifactBuilderBase, ExecutorConfig, Node
+
+
+class MyBuilder(ArtifactBuilderBase):
+    ...
+
+    def pipeline(self):
+        return [
+            Node("load", self.load),
+            Node("distance", self.distance, device="gpu", min_rows=8, max_rows=32),
+            Node("mesh", self.mesh),
+        ]
+
+    def distance(self, items, context):
+        # returns one result per input: None (drop), dict, or list[dict] (fan-out)
+        return [{**item, "field": ...} for item in items]
+```
+
+- `ExecutorConfig(row_workers=N, row_executor="process")` sets the CPU workers. GPU nodes always
+  run on one dedicated thread of the main process; initialize GPU state inside the node function.
+- A node can run once `min_rows` rows are queued and takes up to `max_rows` (default `min_rows`).
+  When no more rows can arrive, it runs with fewer than `min_rows`.
+- Later nodes are scheduled first. A full `max_queue` on the next node pauses the node before it.
+- A failed multi-row call is retried one row at a time. Only rows that still fail are recorded as
+  failed, the other rows continue, and `build()` raises at the end. A later build retries them.
+- Worker count and row limits are not part of the build signature, so they must not change results.
+- `BuildResult.node_stats` reports rows, calls, seconds and errors per node.
+- With `row_executor="process"`, rows are pickled between the main process and workers on every
+  node boundary, so large arrays are copied.
+
 ### `transform_batch(...)` Must Preserve Cardinality
 
 `transform_batch(...)` is not allowed to expand or shrink item count.
