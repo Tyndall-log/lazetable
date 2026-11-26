@@ -10,12 +10,14 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
 from .core import (
+    PAYLOAD_COL_RE,
+    ROW_VIEW_COL_RE,
     ArtifactId,
     LazyTable,
     PathResolution,
@@ -50,10 +52,66 @@ class ArtifactPathFallbackWarning(UserWarning):
     """상대 위치에 artifact 디렉터리가 없어 저장된 절대 경로로 대체할 때 발생한다."""
 
 
+class ColumnConflictError(ValueError):
+    """조인이나 빌드에서 같은 이름의 열(논리 필드)이 두 곳에서 올 때 발생한다."""
+
+
+class JoinKeyError(ValueError):
+    """조인 키가 맞지 않을 때(부모 키 중복, ``how="strict"``에서 짝 없는 자식 행) 발생한다."""
+
+
+JoinHow = Literal["strict", "inner", "left"]
+JOIN_HOWS: tuple[str, ...] = ("strict", "inner", "left")
+
+
 @dataclass(frozen=True)
 class ArtifactJoin:
+    """자식 행과 부모 행을 키로 잇는 규칙.
+
+    - 부모의 조인 키 열은 붙이지 않는다(자식 키와 값이 같다). ``__``로 시작하는 부모 내부 열도 붙이지 않는다.
+    - 나머지 부모 열(논리 필드 단위, payload·row view 메타 열 포함)은 ``rename``에 있으면 그 이름으로,
+      없으면 ``prefix`` + 원래 이름으로 붙는다.
+    - 붙는 이름이 이미 있는 열과 겹치면 ``ColumnConflictError``다(덮어쓰지 않는다).
+    - ``how``: ``"strict"``(기본)는 모든 자식 행에 부모가 있어야 하고, ``"inner"``는 짝 없는 자식 행을 빼고,
+      ``"left"``는 남기고 부모 열을 비운다. 부모 키가 중복이면 어느 경우든 ``JoinKeyError``다.
+    """
+
     child_on: tuple[str, ...]
     parent_on: tuple[str, ...]
+    prefix: str = ""
+    rename: Mapping[str, str] = field(default_factory=dict)
+    how: JoinHow = "strict"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "child_on", tuple(str(name) for name in self.child_on))
+        object.__setattr__(self, "parent_on", tuple(str(name) for name in self.parent_on))
+        object.__setattr__(self, "rename", {str(k): str(v) for k, v in dict(self.rename).items()})
+        if not self.child_on or len(self.child_on) != len(self.parent_on):
+            raise ValueError("child_on and parent_on must be non-empty and have the same length")
+        if self.how not in JOIN_HOWS:
+            raise ValueError(f"join how must be one of {JOIN_HOWS}: {self.how!r}")
+        keys = set(self.parent_on) & set(self.rename)
+        if keys:
+            raise ValueError(f"parent join keys are not carried and cannot be renamed: {sorted(keys)}")
+
+    def as_meta(self) -> dict[str, Any]:
+        return {
+            "child_on": list(self.child_on),
+            "parent_on": list(self.parent_on),
+            "prefix": self.prefix,
+            "rename": dict(sorted(self.rename.items())),
+            "how": self.how,
+        }
+
+    @classmethod
+    def from_meta(cls, meta: Mapping[str, Any]) -> "ArtifactJoin":
+        return cls(
+            child_on=tuple(meta.get("child_on", [])),
+            parent_on=tuple(meta.get("parent_on", [])),
+            prefix=str(meta.get("prefix", "")),
+            rename=dict(meta.get("rename") or {}),
+            how=str(meta.get("how", "strict")),  # type: ignore[arg-type]
+        )
 
 
 @dataclass(frozen=True)
@@ -628,22 +686,14 @@ def serialize_dependencies(dependencies: list[ArtifactDependency]) -> list[dict[
             "artifact_version": dep.artifact_version,
         }
         if dep.join is not None:
-            item["join"] = {
-                "child_on": list(dep.join.child_on),
-                "parent_on": list(dep.join.parent_on),
-            }
+            item["join"] = dep.join.as_meta()
         payload.append(item)
     return payload
 
 
 def _dependency_from_meta(meta: dict[str, Any]) -> ArtifactDependency:
     join_meta = meta.get("join")
-    join = None
-    if isinstance(join_meta, dict):
-        join = ArtifactJoin(
-            child_on=tuple(str(value) for value in join_meta.get("child_on", [])),
-            parent_on=tuple(str(value) for value in join_meta.get("parent_on", [])),
-        )
+    join = ArtifactJoin.from_meta(join_meta) if isinstance(join_meta, dict) else None
     return ArtifactDependency(
         artifact_name=str(meta["artifact_name"]),
         artifact_version=str(meta.get("artifact_version", "latest")),
@@ -756,14 +806,12 @@ def _join_parent_child(
             f"dependency join is required for auto-join: {dependency.artifact_name}@{dependency.artifact_version}"
         )
 
-    child_on = list(dependency.join.child_on)
-    parent_on = list(dependency.join.parent_on)
-    joined_manifest = _join_two_tables_child_wins(
-        parent.table,
-        child.table,
-        child_on=child_on,
-        parent_on=parent_on,
-    )
+    try:
+        joined_manifest = join_arrow_tables(child.table, parent.table, dependency.join)
+    except (ColumnConflictError, JoinKeyError) as error:
+        raise type(error)(
+            f"{dependency.artifact_name}@{dependency.artifact_version} 부모 조인: {error}"
+        ) from error
     child_context = child.resolver_context
     joined_roots = {
         **parent.resolver_context.artifact_roots,
@@ -787,60 +835,127 @@ def _join_parent_child(
     )
 
 
-def _join_two_tables_child_wins(
-    parent: pa.Table,
-    child: pa.Table,
-    *,
-    child_on: list[str],
-    parent_on: list[str],
-) -> pa.Table:
-    if len(child_on) != len(parent_on):
-        raise ValueError("child_on and parent_on must have the same length")
+def logical_field(column: str) -> str:
+    """물리 열 이름의 논리 필드 이름. ``[payload_ref]mesh``·``[row_view_id]mesh`` → ``mesh``."""
 
-    parent_idx_name = "__parent_idx"
-    child_idx_name = "__child_idx"
-    parent_key_table = pa.table(
-        [parent[field] for field in parent_on]
-        + [pa.array(range(parent.num_rows), type=pa.int64())],
-        names=parent_on + [parent_idx_name],
-    )
-    child_key_table = pa.table(
-        [child[field] for field in child_on] + [pa.array(range(child.num_rows), type=pa.int64())],
-        names=child_on + [child_idx_name],
-    )
-    joined = parent_key_table.join(
-        child_key_table,
-        keys=parent_on,
-        right_keys=child_on,
-        join_type="inner",
-        coalesce_keys=True,
-        use_threads=True,
-    )
+    match = PAYLOAD_COL_RE.match(column) or ROW_VIEW_COL_RE.match(column)
+    return column if match is None else match.group("field")
 
-    parent_indices = joined[parent_idx_name]
-    child_indices = joined[child_idx_name]
-    child_names = set(child.column_names)
-    child_join_names = set(child_on)
 
+def is_internal_field(name: str) -> bool:
+    """lazetable 내부 열(``__``로 시작). 조인으로 부모에서 넘어가지 않는다."""
+
+    return name.startswith("__")
+
+
+def _renamed_column(column: str, new_field: str) -> str:
+    match = PAYLOAD_COL_RE.match(column)
+    if match is not None:
+        return f"[payload_{match.group('meta')}]{new_field}"
+    match = ROW_VIEW_COL_RE.match(column)
+    if match is not None:
+        return f"[row_view_{match.group('meta')}]{new_field}"
+    return new_field
+
+
+def joined_parent_fields(parent_columns: list[str], join: ArtifactJoin) -> dict[str, str]:
+    """부모에서 붙을 논리 필드(원래 이름 → 붙는 이름). 키·내부 열은 빠진다.
+
+    ``rename``에 부모에 없는 필드가 있거나, 붙는 이름끼리 겹치면 오류다.
+    """
+
+    fields = []
+    for column in parent_columns:
+        name = logical_field(column)
+        if name not in fields:
+            fields.append(name)
+    carried = [name for name in fields if name not in join.parent_on and not is_internal_field(name)]
+    unknown = sorted(set(join.rename) - set(carried))
+    if unknown:
+        raise ColumnConflictError(f"rename에 부모에 없는(또는 키·내부) 필드가 있음: {unknown}")
+    mapping = {name: join.rename.get(name, f"{join.prefix}{name}") for name in carried}
+    seen: dict[str, str] = {}
+    for original, new in mapping.items():
+        if is_internal_field(new):
+            raise ColumnConflictError(f"부모 필드 {original!r}를 내부 이름 {new!r}로 바꿀 수 없음")
+        if new in seen:
+            raise ColumnConflictError(
+                f"부모 필드 {seen[new]!r}와 {original!r}가 같은 이름 {new!r}로 붙음"
+            )
+        seen[new] = original
+    return mapping
+
+
+def check_field_conflicts(existing: set[str], added: Mapping[str, str], *, where: str) -> None:
+    """``added``(원래 → 붙는 이름)의 붙는 이름이 ``existing`` 논리 필드와 겹치면 오류."""
+
+    conflicts = sorted(new for new in added.values() if new in existing)
+    if conflicts:
+        hints = ", ".join(f"{added_name}" for added_name in conflicts)
+        raise ColumnConflictError(
+            f"{where}: 같은 이름의 열이 이미 있음: {hints}. ArtifactJoin의 prefix나 rename으로 이름을 바꿀 것"
+        )
+
+
+def join_arrow_tables(child: pa.Table, parent: pa.Table, join: ArtifactJoin) -> pa.Table:
+    """자식(왼쪽) 행 순서를 지키며 부모 열을 붙인다. 규칙은 ``ArtifactJoin`` 참고."""
+
+    for name in join.child_on:
+        if name not in child.column_names:
+            raise JoinKeyError(f"자식에 조인 키 열이 없음: {name!r}")
+    for name in join.parent_on:
+        if name not in parent.column_names:
+            raise JoinKeyError(f"부모에 조인 키 열이 없음: {name!r}")
+    mapping = joined_parent_fields(parent.column_names, join)
+    child_fields = {logical_field(column) for column in child.column_names}
+    check_field_conflicts(child_fields, mapping, where="조인")
+
+    parent_keys = list(zip(*(parent[name].to_pylist() for name in join.parent_on), strict=True))
+    index: dict[tuple[Any, ...], int] = {}
+    duplicates: list[tuple[Any, ...]] = []
+    for position, key in enumerate(parent_keys):
+        if key in index:
+            duplicates.append(key)
+        else:
+            index[key] = position
+    if duplicates:
+        raise JoinKeyError(
+            f"부모 키가 중복됨({len(duplicates)}개, 예: {duplicates[:3]}): {list(join.parent_on)}"
+        )
+
+    child_keys = list(zip(*(child[name].to_pylist() for name in join.child_on), strict=True))
+    child_indices: list[int] = []
+    parent_indices: list[int | None] = []
+    missing: list[tuple[Any, ...]] = []
+    for position, key in enumerate(child_keys):
+        found = index.get(key)
+        if found is None:
+            missing.append(key)
+            if join.how == "inner":
+                continue
+            if join.how == "strict":
+                continue
+        child_indices.append(position)
+        parent_indices.append(found)
+    if missing and join.how == "strict":
+        raise JoinKeyError(
+            f"부모가 없는 자식 행 {len(missing)}개(예: {missing[:3]}). "
+            "빼려면 how='inner', 남기려면 how='left'"
+        )
+
+    take_child = pa.array(child_indices, type=pa.int64())
+    take_parent = pa.array(parent_indices, type=pa.int64())
     arrays: list[pa.Array | pa.ChunkedArray] = []
     names: list[str] = []
-
-    for name in parent.column_names:
-        if name in child_names:
+    for column in child.column_names:
+        arrays.append(pc.take(child[column], take_child))
+        names.append(column)
+    for column in parent.column_names:
+        field_name = logical_field(column)
+        if field_name not in mapping:
             continue
-        if name in parent_on and name not in child_join_names:
-            arrays.append(joined[name])
-        else:
-            arrays.append(pc.take(parent[name], parent_indices))
-        names.append(name)
-
-    for name in child.column_names:
-        if name in child_join_names and name in joined.column_names:
-            arrays.append(joined[name])
-        else:
-            arrays.append(pc.take(child[name], child_indices))
-        names.append(name)
-
+        arrays.append(pc.take(parent[column], take_parent))
+        names.append(_renamed_column(column, mapping[field_name]))
     out = pa.table(arrays, names=names)
     if child.schema.metadata:
         out = out.replace_schema_metadata(child.schema.metadata)

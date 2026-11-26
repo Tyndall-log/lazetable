@@ -141,7 +141,7 @@ def test_build_artifact_reference_path(tmp_path: Path) -> None:
         build_context={"input_rows": [{"id": "a", "x": 2}, {"id": "b", "x": 5}]},
     )
     rows = artifact.table.table.to_pylist()
-    assert rows == [{"id": "a", "x2": 4}, {"id": "b", "x2": 10}]
+    assert rows == [{"__sources__": [0], "id": "a", "x2": 4}, {"__sources__": [1], "id": "b", "x2": 10}]
 
 
 class QueuedTransform(ArtifactBuilderBase):

@@ -204,6 +204,12 @@ class SQLiteArtifactStore:
                     PRIMARY KEY (namespace, key)
                 );
 
+                CREATE TABLE IF NOT EXISTS build_plans (
+                    stage INTEGER PRIMARY KEY,
+                    plan_hash TEXT NOT NULL,
+                    unit_count INTEGER NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS source_rows_status_idx
                     ON source_rows(status);
                 CREATE INDEX IF NOT EXISTS payloads_relative_path_idx
@@ -318,6 +324,23 @@ class SQLiteArtifactStore:
                 "WHERE singleton=1",
                 (count, _now()),
             )
+
+    def check_plan(self, stage: int, plan_hash: str, unit_count: int) -> None:
+        """단계의 묶음 계획을 기록한다. 이미 있으면(재개) 같은지 확인하고 다르면 오류다."""
+
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT plan_hash, unit_count FROM build_plans WHERE stage=?", (stage,)
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO build_plans VALUES(?, ?, ?)", (stage, plan_hash, unit_count)
+                )
+            elif row["plan_hash"] != plan_hash or int(row["unit_count"]) != unit_count:
+                raise ValueError(
+                    f"partial artifact plan mismatch at stage {stage}: "
+                    f"stored {row['plan_hash'][:12]}({row['unit_count']}) != {plan_hash[:12]}({unit_count})"
+                )
 
     def completed_sources(self) -> set[int]:
         connection = self._connect(read_only=True)

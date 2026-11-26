@@ -152,26 +152,72 @@ class MyBuilder(ArtifactBuilderBase):
     def pipeline(self):
         return [
             Node("load", self.load),
-            Node("distance", self.distance, device="gpu", min_rows=8, max_rows=32),
+            Node("distance", self.distance, device="gpu", min_items=8, max_items=32),
             Node("mesh", self.mesh),
         ]
 
     def distance(self, items, context):
+        # each item is a Group; groups=None gives one-row groups, so g[0] is the row.
         # returns one result per input: None (drop), dict, or list[dict] (fan-out)
-        return [{**item, "field": ...} for item in items]
+        return [{**g[0], "field": ...} for g in items]
 ```
 
+- Every node receives a list of `Group`s. A `Group` behaves like a list (`len`, iteration,
+  indexing) and has `.key`. With `groups=None` (default) each group holds one row: the previous
+  node's result, or the source row for the first node.
 - `ExecutorConfig(row_workers=N, row_executor="process")` sets the CPU workers. GPU nodes always
   run on one dedicated thread of the main process; initialize GPU state inside the node function.
-- A node can run once `min_rows` rows are queued and takes up to `max_rows` (default `min_rows`).
-  When no more rows can arrive, it runs with fewer than `min_rows`.
+- A node can run once `min_items` groups are queued and takes up to `max_items` (default
+  `min_items`). When no more groups can arrive, it runs with fewer than `min_items`. These only
+  batch calls; they never split or merge groups.
 - Later nodes are scheduled first. A full `max_queue` on the next node pauses the node before it.
-- A failed multi-row call is retried one row at a time. Only rows that still fail are recorded as
-  failed, the other rows continue, and `build()` raises at the end. A later build retries them.
-- Worker count and row limits are not part of the build signature, so they must not change results.
+- A failed multi-group call is retried one group at a time. Only groups that still fail are
+  recorded as failed, the others continue, and `build()` raises at the end. A later build retries.
+- Worker count and batch limits are not part of the build signature, so they must not change results.
 - `BuildResult.node_stats` reports rows, calls, seconds and errors per node.
-- With `row_executor="process"`, rows are pickled between the main process and workers on every
+- With `row_executor="process"`, groups are pickled between the main process and workers on every
   node boundary, so large arrays are copied.
+- `context.parents` maps `"<name>@<version>"` (and `"<name>"` when unique) to the parent tables.
+- Output rows carry `__sources__`: the source row numbers the row came from.
+
+### Grouping rows into nodes (n:1, n:n)
+
+`Node(..., groups=...)` makes the node receive rows of the previous node (the source rows for the
+first node) grouped by a rule. `self.grouping` builds the common rules:
+
+```python
+class TeethFromPieces(ArtifactBuilderBase):
+    def pipeline(self):
+        g = self.grouping
+        return [
+            Node("decode", decode_piece),                                       # one row at a time
+            Node("split", split_teeth, device="gpu",
+                 groups=g.by_columns("case_key", "jaw")),                       # pieces of one arch
+        ]
+
+def split_teeth(groups, context):
+    out = []
+    for g in groups:            # g.key == (case_key, jaw), g is the list of pieces
+        out.append([{"tooth_key": ..., "fdi": fdi} for fdi in ...])            # 1:n per group
+    return out
+```
+
+- `g.by_columns("a", "b")`: rows with equal values form one group (key is the value, or a tuple).
+- `g.by_list_column("cases")`: a row joins one group per value of the list column (overlap).
+- `g.by_key(fn, uses=("a",))`: key computed by `fn(item)`.
+- Any callable `groups=fn(items) -> [Group(members, key=...), ...]` for free-form groups. `items`
+  are `ItemMeta` objects (`.id`, `.values`, `.sources`) holding only JSON-like meta values.
+- A row may be in several groups. A missing key becomes the hash of the member ids. An empty group,
+  the same member twice in one group, or the same key twice raises `GroupingError`.
+- Groups on the first node are planned before running (from the source rows). Groups on a later
+  node are a barrier: the stage before it writes each finished group's results to
+  `stages.sqlite` (meta values as JSON, full rows pickled) and the next stage reads only its own
+  members. Finished stage units are not recomputed after a restart. If any unit of a barrier stage
+  fails, the build stops before grouping (the next groups need all results); a rerun retries only
+  the failed units. `ExecutorConfig(stage_cache_mb=...)` caps the SQLite page cache of that store,
+  and `keep_stages=True` keeps it after the build.
+- The commit unit of the artifact is a group of the last stage. Each group's plan hash is stored
+  and a resumed build with a different plan fails.
 
 ### `transform_batch(...)` Must Preserve Cardinality
 
@@ -359,6 +405,30 @@ Parents opened through `join_parents` use the same rule for both where the paren
 opened and how its payload refs resolve. A table remembers its rule, so a later
 `table.join_parents()` follows it. Read-only SQLite connections accept UNC paths
 (`\\host\share\...`, including `\\?\UNC\...`).
+
+### Joins never overwrite
+
+`join_parents()` and `LazyTable.join()` follow the same rules (`ArtifactJoin`):
+
+- The parent's key columns and its internal `__...` columns are not carried. Every other parent
+  field (with its `[payload_*]`/`[row_view_*]` columns) is added as `rename[name]` or
+  `prefix + name`.
+- If an added name already exists, `ColumnConflictError` is raised. Nothing is overwritten.
+- `how="strict"` (default) requires a parent for every child row, `"inner"` drops child rows
+  without a parent, `"left"` keeps them with empty parent fields. Duplicate parent keys raise
+  `JoinKeyError`. Child row order is kept.
+- `build()` checks this early: an output field that a parent join would add, a parent added name
+  that collides with another parent's, or a missing child join key raises before rows are written.
+
+```python
+dependencies = [
+    ArtifactDependency("mesh", "v1", join=ArtifactJoin(("jaw_mesh_id",), ("mesh_id",), prefix="jaw_")),
+    ArtifactDependency("mesh", "v1", join=ArtifactJoin(("ant_mesh_id",), ("mesh_id",),
+                                                       rename={"mesh": "antagonist_mesh"})),
+]
+
+labels = hook_labels.join(type_labels, on="unit_uid", prefix="type_", how="left")
+```
 
 ## 학습용 DatasetIndex
 

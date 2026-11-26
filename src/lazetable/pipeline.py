@@ -5,8 +5,8 @@ builder가 ``pipeline()``으로 ``Node`` 목록을 돌려주면 ``transform_row`
 
 - CPU 노드는 ``row_workers``개 워커가, GPU 노드는 메인 프로세스의 전용 스레드 하나가 실행한다.
   GPU 초기화는 노드 함수 안에서 하면 항상 그 스레드에서 일어난다.
-- 노드는 입력 대기열에 ``min_rows``행이 차면 실행할 수 있고, 한 번에 ``max_rows``행까지 가져간다.
-  앞 노드가 모두 끝나 더 올 행이 없으면 ``min_rows``보다 적어도 실행한다.
+- 노드는 입력 대기열에 ``min_items``개(묶음)가 차면 실행할 수 있고, 한 번에 ``max_items``개까지 가져간다.
+  앞 노드가 모두 끝나 더 올 묶음이 없으면 ``min_items``보다 적어도 실행한다.
 - 실행할 수 있는 노드가 여럿이면 뒤쪽 노드부터 고른다. 다음 노드 대기열이 ``max_queue``에 차면
   앞 노드를 멈춰 메모리를 제한한다.
 - 여러 행 묶음이 실패하면 한 행씩 다시 실행해, 실제로 실패한 행만 실패로 기록하고 나머지는 계속한다.
@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     BrokenExecutor,
@@ -26,8 +26,10 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     wait,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+from .grouping import Group, as_group_spec
 
 DEVICES = ("cpu", "gpu")
 
@@ -44,26 +46,35 @@ class NodeContext:
     build_context: Mapping[str, Any]
     sandbox_registry: Any
     seed_plan: Any
+    parents: Mapping[str, Any] = field(default_factory=dict)  # 부모 표: "이름@판"과(겹치지 않으면) "이름"
 
 
 @dataclass(frozen=True)
 class Node:
     """파이프라인 블록.
 
-    ``fn(items, context)``은 입력과 같은 길이의 목록을 돌려준다. 각 원소는 그 입력 행의 결과로,
-    ``None``(행 탈락), ``dict``(한 행), ``list[dict]``(여러 행) 중 하나다.
+    ``fn(items, context)``의 ``items`` 원소 하나는 ``Group``(목록처럼 쓰고 ``.key``) 하나다.
+    ``groups=None``이면 앞 노드 결과(첫 노드는 원본 행) 한 행짜리 묶음이고, ``groups=...``이면 앞 결과를
+    그 규칙으로 묶은 것이다(``lazetable.grouping`` 참고). 결과는 입력과 같은 길이의 목록이고, 각 원소는
+    그 묶음의 결과로 ``None``(없음), ``dict``(한 행), ``list[dict]``(여러 행) 중 하나다.
+
+    ``min_items``/``max_items``는 한 번에 보낼 묶음 수(스케줄링 값)이고 묶음을 나누거나 합치지 않는다.
     """
 
     name: str
     fn: Callable[[list[Any], NodeContext], list[Any]]
     device: str = "cpu"
-    min_rows: int = 1
-    max_rows: int | None = None  # 기본값은 min_rows
-    max_queue: int | None = None  # 입력 대기열 상한. 기본값은 max_rows의 2배와 CPU 워커 2배 중 큰 값
+    groups: Any = None
+    min_items: int = 1
+    max_items: int | None = None  # 기본값은 min_items
+    max_queue: int | None = None  # 입력 대기열 상한. 기본값은 max_items의 2배와 CPU 워커 2배 중 큰 값
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "groups", as_group_spec(self.groups))
 
     @property
     def batch_limit(self) -> int:
-        return self.min_rows if self.max_rows is None else self.max_rows
+        return self.min_items if self.max_items is None else self.max_items
 
 
 def validate_nodes(nodes: list[Node]) -> None:
@@ -75,17 +86,36 @@ def validate_nodes(nodes: list[Node]) -> None:
     for node in nodes:
         if node.device not in DEVICES:
             raise ValueError(f"{node.name}: device must be one of {DEVICES}")
-        if node.min_rows < 1:
-            raise ValueError(f"{node.name}: min_rows must be positive")
-        if node.batch_limit < node.min_rows:
-            raise ValueError(f"{node.name}: max_rows must be >= min_rows")
+        if node.min_items < 1:
+            raise ValueError(f"{node.name}: min_items must be positive")
+        if node.batch_limit < node.min_items:
+            raise ValueError(f"{node.name}: max_items must be >= min_items")
         if node.max_queue is not None and node.max_queue < node.batch_limit:
-            raise ValueError(f"{node.name}: max_queue must be >= max_rows")
+            raise ValueError(f"{node.name}: max_queue must be >= max_items")
 
 
-def pipeline_signature(nodes: list[Node]) -> list[dict[str, str]]:
+def split_stages(nodes: list[Node]) -> list[tuple[int, list[Node]]]:
+    """첫 노드가 아닌 ``groups`` 노드에서 나눈 단계들((시작 위치, 노드 목록))."""
+
+    stages: list[tuple[int, list[Node]]] = []
+    for index, node in enumerate(nodes):
+        if index == 0 or node.groups is not None:
+            stages.append((index, [node]))
+        else:
+            stages[-1][1].append(node)
+    return stages
+
+
+def pipeline_signature(nodes: list[Node]) -> list[dict[str, Any]]:
     """결과에 영향을 주는 구성만 담는다. 묶음 크기와 워커 수는 속도에만 영향을 줘야 한다."""
-    return [{"name": node.name, "device": node.device} for node in nodes]
+    return [
+        {
+            "name": node.name,
+            "device": node.device,
+            "groups": None if node.groups is None else node.groups.signature(),
+        }
+        for node in nodes
+    ]
 
 
 def _call_node(node: Node, items: list[Any], context: NodeContext) -> tuple[list[Any], float]:
@@ -103,12 +133,16 @@ def _call_node(node: Node, items: list[Any], context: NodeContext) -> tuple[list
 _WORKER_STATE: tuple[list[Node], tuple[Any, ...]] | None = None
 
 
-def _initialize_worker(builder: Any, parent_rows, build_context, sandbox_registry, seed_plan):
+def _initialize_worker(builder: Any, parent_rows, build_context, sandbox_registry, seed_plan, parents):
     global _WORKER_STATE
-    _WORKER_STATE = (builder.pipeline(), (parent_rows, build_context, sandbox_registry, seed_plan))
+    _WORKER_STATE = (
+        builder.pipeline(),
+        (parent_rows, build_context, sandbox_registry, seed_plan, parents),
+    )
 
 
 def _run_in_worker(index: int, items: list[Any], batch_idx: int) -> tuple[list[Any], float]:
+    """``index``는 빌더 ``pipeline()`` 전체에서의 위치다."""
     if _WORKER_STATE is None:
         raise RuntimeError("process worker was not initialized")
     nodes, shared = _WORKER_STATE
@@ -140,7 +174,7 @@ def _normalize_outputs(value: Any) -> list[dict[str, Any]]:
 def run_pipeline(
     builder: Any,
     nodes: list[Node],
-    rows: list[Any],
+    rows: Sequence[Group],
     *,
     parent_rows: list[Any],
     build_context: Mapping[str, Any],
@@ -152,9 +186,20 @@ def run_pipeline(
     emit: Callable[[int, int, dict[str, Any]], None],
     finish_source: Callable[[int], None],
     fail_source: Callable[[int, BaseException], None],
+    node_offset: int = 0,
+    parents: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[int, BaseException]]:
-    """모든 행을 처리하고 (노드별 통계, 실패한 source 행)을 돌려준다."""
+    """단계 하나의 노드를 실행하고 (노드별 통계, 실패한 단위)를 돌려준다.
+
+    ``rows``의 원소 하나(묶음 하나)가 단위다. 결과·완료·실패는 단위 번호로 알린다. 첫 노드는 그 묶음을,
+    뒤 노드는 앞 노드 결과를 한 행짜리 묶음으로 받는다. ``node_offset``은 이 단계 첫 노드의 빌더
+    ``pipeline()`` 안 위치다(프로세스 워커가 노드를 찾는 데 쓴다).
+    """
     validate_nodes(nodes)
+    for node in nodes[1:]:
+        if node.groups is not None:
+            raise ValueError(f"{node.name}: groups는 단계 첫 노드에만 올 수 있음")
+    shared_parents = dict(parents or {})
     if cpu_executor not in {"thread", "process"}:
         raise ValueError("row_executor must be 'thread' or 'process'")
     count = len(nodes)
@@ -182,7 +227,13 @@ def run_pipeline(
 
     def context(index: int, number: int) -> NodeContext:
         return NodeContext(
-            nodes[index].name, number, parent_rows, build_context, sandbox_registry, seed_plan
+            nodes[index].name,
+            number,
+            parent_rows,
+            build_context,
+            sandbox_registry,
+            seed_plan,
+            shared_parents,
         )
 
     def refill() -> None:
@@ -210,7 +261,7 @@ def run_pipeline(
         if retries[index]:
             return [retries[index].popleft()]
         queue = queues[index]
-        if not queue or (len(queue) < nodes[index].min_rows and not upstream_done(index)):
+        if not queue or (len(queue) < nodes[index].min_items and not upstream_done(index)):
             return None
         return [queue.popleft() for _ in range(min(nodes[index].batch_limit, len(queue)))]
 
@@ -249,7 +300,7 @@ def run_pipeline(
             if last:
                 outputs[source].append((entry, result))
             else:
-                queues[index + 1].append((source, entry, result))
+                queues[index + 1].append((source, entry, Group.single(result)))
         if live[source] == 0:
             complete(source)
 
@@ -261,7 +312,7 @@ def run_pipeline(
         cpu_pool = ProcessPoolExecutor(
             cpu_workers,
             initializer=_initialize_worker,
-            initargs=(builder, parent_rows, build_context, sandbox_registry, seed_plan),
+            initargs=(builder, parent_rows, build_context, sandbox_registry, seed_plan, shared_parents),
         )
     gpu_pool = None
     if any(node.device == "gpu" for node in nodes):
@@ -284,7 +335,7 @@ def run_pipeline(
                 if device == "gpu":
                     future = gpu_pool.submit(_call_node, nodes[index], items, context(index, number))
                 elif cpu_workers > 0 and cpu_executor == "process":
-                    future = cpu_pool.submit(_run_in_worker, index, items, number)
+                    future = cpu_pool.submit(_run_in_worker, node_offset + index, items, number)
                 else:
                     future = cpu_pool.submit(_call_node, nodes[index], items, context(index, number))
                 futures[future] = (index, tagged)

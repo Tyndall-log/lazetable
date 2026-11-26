@@ -6,20 +6,20 @@ from pathlib import Path
 
 import pytest
 
-from lazetable import ArtifactBuilderBase, BuildPolicy, ExecutorConfig, Node, WriterConfig
+from lazetable import ArtifactBuilderBase, BuildPolicy, ExecutorConfig, Group, Node, WriterConfig
 from lazetable.pipeline import run_pipeline, validate_nodes
 
 
 def _add_cpu(items, context):
-    return [{**item, "cpu": item["id"] * 2} for item in items]
+    return [{**g[0], "cpu": g[0]["id"] * 2} for g in items]
 
 
 def _add_gpu(items, context):
-    return [{**item, "gpu_thread": threading.current_thread().name, "size": len(items)} for item in items]
+    return [{**g[0], "gpu_thread": threading.current_thread().name, "size": len(items)} for g in items]
 
 
 def _finish(items, context):
-    return [{**item, "done": True} for item in items]
+    return [{**g[0], "done": True} for g in items]
 
 
 class NodeBuilder(ArtifactBuilderBase):
@@ -33,7 +33,7 @@ class NodeBuilder(ArtifactBuilderBase):
     def pipeline(self):
         return [
             Node("first", _add_cpu),
-            Node("gpu", _add_gpu, device="gpu", min_rows=4, max_rows=4),
+            Node("gpu", _add_gpu, device="gpu", min_items=4, max_items=4),
             Node("last", _finish),
         ]
 
@@ -58,7 +58,7 @@ def test_builds_through_cpu_and_gpu_nodes(tmp_path: Path, config) -> None:
     assert sorted(int(r.id) for r in rows) == list(range(10))
     assert all(r.done and int(r.cpu) == int(r.id) * 2 for r in rows)
     assert {str(r.gpu_thread).rsplit("_", 1)[0] for r in rows} == {"lazetable-gpu"}
-    # 4행씩 묶고, 더 올 행이 없는 마지막 2행은 min_rows보다 적어도 실행한다
+    # 4행씩 묶고, 더 올 행이 없는 마지막 2행은 min_items보다 적어도 실행한다
     assert sorted(int(r.size) for r in rows) == [2, 2, 4, 4, 4, 4, 4, 4, 4, 4]
     assert result.node_stats["gpu"]["rows"] == 10
     assert result.node_stats["gpu"]["calls"] == 3
@@ -85,7 +85,7 @@ def _run(nodes, count, *, workers=0, executor="thread", skip=()):
     stats, failures = run_pipeline(
         None,
         nodes,
-        [{"id": i} for i in range(count)],
+        [Group.single({"id": i}, member_id=f"s{i}", sources=(i,)) for i in range(count)],
         parent_rows=[],
         build_context={},
         sandbox_registry=None,
@@ -106,7 +106,7 @@ def test_later_node_runs_first() -> None:
     def record(name):
         def fn(items, context):
             order.append(name)
-            return items
+            return [g[0] for g in items]
 
         return fn
 
@@ -122,13 +122,13 @@ def test_queue_cap_limits_rows_ahead_of_slow_gpu() -> None:
         with lock:
             seen["cpu_done"] += len(items)
             seen["ahead"] = max(seen["ahead"], seen["cpu_done"] - seen["gpu_calls"])
-        return items
+        return [g[0] for g in items]
 
     def gpu(items, context):
         time.sleep(0.01)
         with lock:
             seen["gpu_calls"] += len(items)
-        return items
+        return [g[0] for g in items]
 
     nodes = [Node("cpu", cpu), Node("gpu", gpu, device="gpu", max_queue=3)]
     emitted, *_ = _run(nodes, 30, workers=4)
@@ -142,11 +142,11 @@ def test_failed_batch_retries_one_by_one_and_keeps_others() -> None:
 
     def gpu(items, context):
         sizes.append(len(items))
-        if any(item["id"] == 2 for item in items):
+        if any(g[0]["id"] == 2 for g in items):
             raise ValueError("bad row")
-        return items
+        return [g[0] for g in items]
 
-    nodes = [Node("gpu", gpu, device="gpu", min_rows=4, max_rows=4), Node("last", _finish)]
+    nodes = [Node("gpu", gpu, device="gpu", min_items=4, max_items=4), Node("last", _finish)]
     emitted, finished, failed, stats, failures = _run(nodes, 4)
     assert sizes == [4, 1, 1, 1, 1]
     assert sorted(finished) == [0, 1, 3] and sorted(failed) == [2]
@@ -156,10 +156,10 @@ def test_failed_batch_retries_one_by_one_and_keeps_others() -> None:
 
 def test_fan_out_and_drop_keep_deterministic_order() -> None:
     def split(items, context):
-        return [None if item["id"] == 0 else [{"id": item["id"], "n": n} for n in range(3)] for item in items]
+        return [None if g[0]["id"] == 0 else [{"id": g[0]["id"], "n": n} for n in range(3)] for g in items]
 
     def slow_first(items, context):
-        return [{**item, "m": 1} for item in items]
+        return [{**g[0], "m": 1} for g in items]
 
     emitted, finished, *_ = _run([Node("split", split), Node("tail", slow_first)], 2, workers=3)
     assert sorted(finished) == [0, 1]
@@ -185,15 +185,15 @@ def test_build_reports_failed_rows_and_retries_them(tmp_path: Path) -> None:
             return [Node("step", self.step)]
 
         def step(self, items, context):
-            if Path(context.build_context["sentinel"]).exists() and items[0]["id"] == "b":
+            if Path(context.build_context["sentinel"]).exists() and items[0][0]["id"] == "b":
                 raise ValueError("fail once")
-            return items
+            return [g[0] for g in items]
 
     sentinel = tmp_path / "sentinel"
     sentinel.touch()
     context = {"sentinel": str(sentinel)}
     config = ExecutorConfig(row_workers=0)
-    with pytest.raises(RuntimeError, match="1 source rows failed"):
+    with pytest.raises(RuntimeError, match="1 units failed"):
         Flaky().build(storage_root=tmp_path, build_context=context, policy=BuildPolicy(), executor_config=config)
     sentinel.unlink()
     result = Flaky().build(storage_root=tmp_path, build_context=context, policy=BuildPolicy(), executor_config=config)
@@ -205,9 +205,9 @@ def test_validate_rejects_bad_nodes() -> None:
         [],
         [Node("a", _finish), Node("a", _finish)],
         [Node("a", _finish, device="npu")],
-        [Node("a", _finish, min_rows=0)],
-        [Node("a", _finish, min_rows=4, max_rows=2)],
-        [Node("a", _finish, min_rows=4, max_queue=2)],
+        [Node("a", _finish, min_items=0)],
+        [Node("a", _finish, min_items=4, max_items=2)],
+        [Node("a", _finish, min_items=4, max_queue=2)],
     ):
         with pytest.raises(ValueError):
             validate_nodes(nodes)

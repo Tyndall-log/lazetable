@@ -7,7 +7,9 @@ from .artifacts import (
     ArtifactPathFallbackWarning,
     ArtifactStore,
     ArtifactStorePaths,
+    ColumnConflictError,
     DuplicateArtifactKeyError,
+    JoinKeyError,
     ExternalPayloadRef,
     MissingArtifactKeyFieldError,
     Payload,
@@ -34,6 +36,7 @@ from .core import (
     resolve_ref,
 )
 from .datasets import DatasetIndex, DatasetRecord, SampleAdapter, TorchDatasetAdapter
+from .grouping import Group, GroupingError, ItemMeta
 from .pipeline import Node, NodeContext
 from .registry import register_parser, register_payload_type, register_row_view
 from .transforms import (
@@ -61,10 +64,15 @@ __all__ = [
     "BuildPolicy",
     "BuildResult",
     "BuildContextView",
+    "ColumnConflictError",
     "DuplicateArtifactKeyError",
+    "JoinKeyError",
     "DatasetIndex",
     "DatasetRecord",
     "ExternalPayloadRef",
+    "Group",
+    "GroupingError",
+    "ItemMeta",
     "LazyTable",
     "MissingArtifactKeyFieldError",
     "MissingSandboxKeyError",

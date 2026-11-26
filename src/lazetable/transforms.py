@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping, Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -18,9 +18,14 @@ from typing import Any
 from tqdm import tqdm
 
 from .artifacts import (
+    INTERNAL_SOURCE_ROW_IDX,
     ArtifactDependency,
     ArtifactWriter,
-    INTERNAL_SOURCE_ROW_IDX,
+    ColumnConflictError,
+    JoinKeyError,
+    check_field_conflicts,
+    joined_parent_fields,
+    logical_field,
     serialize_dependencies,
 )
 from .builds import (
@@ -33,8 +38,20 @@ from .builds import (
     stable_hash,
 )
 from .core import LazyTable, ParsedRow, SandboxRegistry
-from .pipeline import BatchCardinalityError, Node, pipeline_signature, run_pipeline, validate_nodes
+from .grouping import Group, Grouping, ItemMeta, meta_values, plan_groups
+from .pipeline import (
+    BatchCardinalityError,
+    Node,
+    pipeline_signature,
+    run_pipeline,
+    split_stages,
+    validate_nodes,
+)
 from .sqlite_store import SQLiteArtifactStore
+from .stages import StageStore, StageUnits
+
+SOURCES_FIELD = "__sources__"  # 결과 행의 원본 행 번호(묶음 구성원을 원본까지 거슬러 올라간 것)
+_GROUPING = Grouping()
 
 MutableBuildContext = MutableMapping[str, Any]
 BuildContextView = Mapping[str, Any]
@@ -72,6 +89,47 @@ class ExecutorConfig:
     batch_size: int = 32
     max_inflight: int | None = None
     row_executor: str = "process"
+    stage_cache_mb: int = 256  # 장벽 단계 저장소(SQLite) 페이지 캐시 상한
+    keep_stages: bool = False  # 빌드가 끝난 뒤 장벽 단계 저장소(stages.sqlite)를 남길지
+
+
+class OutputFieldGuard:
+    """빌더 출력 행이 부모 조인으로 붙을 열과 겹치지 않는지, 조인 키를 갖는지 검사한다.
+
+    부모 열(``prefix``·``rename`` 적용 후)끼리 겹치면 만들 때 바로 오류다. 출력 행 검사는 행마다
+    논리 필드 이름 집합만 본다.
+    """
+
+    def __init__(self, dependencies: list[ArtifactDependency], parent_tables: list[LazyTable]) -> None:
+        self.added: dict[str, str] = {}  # 붙는 이름 → "부모@판"
+        self.required: dict[str, str] = {}  # 자식 조인 키 → "부모@판"
+        for position, dependency in enumerate(dependencies):
+            if dependency.join is None or position >= len(parent_tables):
+                continue
+            where = f"{dependency.artifact_name}@{dependency.artifact_version}"
+            mapping = joined_parent_fields(parent_tables[position].table.column_names, dependency.join)
+            check_field_conflicts(set(self.added), mapping, where=f"부모 {where}와 앞선 부모")
+            for new in mapping.values():
+                self.added[new] = where
+            for key in dependency.join.child_on:
+                self.required.setdefault(key, where)
+
+    def check(self, row: Any) -> None:
+        if not self.added and not self.required:
+            return
+        keys = row.keys() if isinstance(row, Mapping) else row.as_dict().keys()
+        fields = {logical_field(str(key)) for key in keys if key != INTERNAL_SOURCE_ROW_IDX}
+        conflicts = sorted(fields & set(self.added))
+        if conflicts:
+            detail = ", ".join(f"{name}(부모 {self.added[name]})" for name in conflicts)
+            raise ColumnConflictError(
+                f"빌더 출력 열이 부모 조인으로 붙는 열과 겹침: {detail}. "
+                "출력 이름을 바꾸거나 ArtifactJoin의 prefix·rename을 쓸 것"
+            )
+        missing = sorted(set(self.required) - fields)
+        if missing:
+            detail = ", ".join(f"{name}(부모 {self.required[name]})" for name in missing)
+            raise JoinKeyError(f"빌더 출력 행에 조인 키가 없음: {detail}")
 
 
 @dataclass(frozen=True)
@@ -155,6 +213,12 @@ class ArtifactBuilderBase:
 
         return None
 
+    @property
+    def grouping(self) -> Grouping:
+        """노드 ``groups=``에 쓰는 묶음 규칙 도우미(``by_columns``, ``by_list_column``, ``by_key``)."""
+
+        return _GROUPING
+
     def transform_row(
         self,
         row: dict[str, Any],
@@ -221,6 +285,7 @@ class ArtifactBuilderBase:
         for table in parent_tables_list:
             parent_rows.extend(list(table))
         context = dict(build_context or {})
+        output_guard = OutputFieldGuard(list(self.dependencies), parent_tables_list)
         cfg = executor_config or self.executor_config
         nodes = self.pipeline()
         if nodes is not None:
@@ -301,11 +366,56 @@ class ArtifactBuilderBase:
         )
         if transform_limit is not None:
             prepared_rows = prepared_rows[: max(0, int(transform_limit))]
-        store.ensure_source_rows(len(prepared_rows))
+        parents = parent_table_map(list(self.dependencies), parent_tables_list)
+
+        # 단계 실행: 마지막 단계의 단위(묶음)가 커밋 단위다. 앞 단계(장벽)는 디스크 저장소에 결과를 둔다.
+        stages = split_stages(nodes) if nodes is not None else []
+        stage_store: StageStore | None = None
+        stage_stats: dict[str, dict[str, Any]] = {}
+        if nodes is None:
+            final_units: Sequence[Any] = prepared_rows
+            unit_sources: Callable[[int], tuple[int, ...]] = lambda index: (index,)
+        else:
+            final_units, unit_sources = _stage_zero_units(nodes[0], prepared_rows, store)
+            if len(stages) > 1:
+                stage_store = StageStore(staging_dir / "stages.sqlite", cache_mb=cfg.stage_cache_mb)
+            try:
+                for stage_idx, (offset, stage_nodes) in enumerate(stages[:-1]):
+                    assert stage_store is not None
+                    stats = _run_barrier_stage(
+                        self,
+                        stage_idx,
+                        offset,
+                        stage_nodes,
+                        final_units,
+                        unit_sources,
+                        stage_store=stage_store,
+                        policy=policy,
+                        parent_rows=parent_rows,
+                        parents=parents,
+                        build_context=context,
+                        sandbox_registry=sandbox_registry,
+                        seed_plan=seed_plan,
+                        executor_config=cfg,
+                    )
+                    stage_stats.update(stats)
+                    next_spec = stages[stage_idx + 1][1][0].groups
+                    planned, plan_hash = plan_groups(next_spec, stage_store.item_metas(stage_idx))
+                    store.check_plan(stage_idx + 1, plan_hash, len(planned))
+                    stage_units = StageUnits(stage_store, planned)
+                    final_units, unit_sources = stage_units, stage_units.sources
+            except BaseException:
+                if stage_store is not None:
+                    stage_store.close()
+                raise
+
+        store.ensure_source_rows(len(final_units))
         store.remove_orphan_payloads(staging_dir)
         completed = store.completed_sources()
         failures = store.failed_sources()
         if failures and not policy.retry_failed:
+            if stage_store is not None:
+                stage_store.close()
             raise RuntimeError(f"partial build contains failed source rows: {sorted(failures)}")
         for failed_idx in failures:
             store.clear_failure(failed_idx)
@@ -330,13 +440,16 @@ class ArtifactBuilderBase:
         node_failures: dict[int, BaseException] = {}
         try:
             with tqdm(
-                total=len(prepared_rows),
+                total=len(final_units),
                 initial=len(completed),
-                desc="artifact_build",
-                unit="row",
+                desc="artifact_build" if len(stages) < 2 else f"artifact_build:{stages[-1][1][0].name}",
+                unit="unit",
             ) as progress:
 
                 def emit(source_idx: int, output_idx: int, row: dict[str, Any]) -> None:
+                    output_guard.check(row)
+                    row = dict(row)
+                    row[SOURCES_FIELD] = list(unit_sources(source_idx))
                     payload_writer.submit(source_idx, output_idx, row)
 
                 def finish(source_idx: int) -> None:
@@ -363,10 +476,11 @@ class ArtifactBuilderBase:
                         fail_source=payload_writer.mark_failed,
                     )
                 else:
+                    offset, stage_nodes = stages[-1]
                     node_stats, node_failures = run_pipeline(
                         self,
-                        nodes,
-                        prepared_rows,
+                        stage_nodes,
+                        final_units,
                         parent_rows=parent_rows,
                         build_context=context,
                         sandbox_registry=sandbox_registry,
@@ -377,68 +491,85 @@ class ArtifactBuilderBase:
                         emit=emit,
                         finish_source=finish,
                         fail_source=fail_node_row,
+                        node_offset=offset,
+                        parents=parents,
                     )
+                    node_stats = {**stage_stats, **node_stats}
             payload_writer.close()
         except BaseException:
             try:
                 payload_writer.close()
             except BaseException:
                 pass
+            if stage_store is not None:
+                stage_store.close()
             raise
 
-        if node_failures:
-            first = min(node_failures)
-            raise RuntimeError(
-                f"{len(node_failures)} source rows failed; first is row {first}: "
-                f"{type(node_failures[first]).__name__}: {node_failures[first]}"
+        try:
+            if node_failures:
+                first = min(node_failures)
+                raise RuntimeError(
+                    f"{len(node_failures)} units failed; first is unit {first}: "
+                    f"{type(node_failures[first]).__name__}: {node_failures[first]}"
+                )
+            final_completed = store.completed_sources()
+            if len(final_completed) != len(final_units):
+                raise RuntimeError(
+                    "build did not complete every unit: "
+                    f"completed={len(final_completed)}, total={len(final_units)}"
+                )
+            store.set_phase("finalizing")
+            finalize_result = self.finalize_manifest(
+                store.raw_rows(),
+                parent_rows=parent_rows,
+                build_context=context,
+                sandbox_registry=sandbox_registry,
+                seed_plan=seed_plan,
             )
-        final_completed = store.completed_sources()
-        if len(final_completed) != len(prepared_rows):
-            raise RuntimeError(
-                "build did not complete every source row: "
-                f"completed={len(final_completed)}, total={len(prepared_rows)}"
+            rows_with_keys = []
+            for row in finalize_result.rows:
+                keyed = dict(row)
+                keyed["__unique_key__"] = [keyed[field] for field in self.primary_unique_key()]
+                rows_with_keys.append(keyed)
+            store.set_phase("validating")
+            store.validate_payloads(staging_dir, verify_hash=True)
+            for position, parent in enumerate(parent_tables_list):
+                if parent.path is None or position >= len(dependency_records):
+                    continue
+                parent_artifact = SQLiteArtifactStore(parent.path / "artifact.sqlite").artifact(
+                    read_only=True
+                )
+                expected_hash = dependency_records[position].get("manifest_hash")
+                actual_hash = None if parent_artifact is None else parent_artifact.content_hash
+                if parent_artifact is None or parent_artifact.status != "completed":
+                    raise ValueError(f"parent artifact is not completed: {parent.path}")
+                if expected_hash != actual_hash:
+                    raise ValueError(f"parent artifact changed during build: {parent.path}")
+            content_hash = stable_hash(rows_with_keys)
+            store.set_phase("committing")
+            store.finalize(
+                rows=rows_with_keys,
+                metadata={
+                    **finalize_result.metadata,
+                    "dependencies": serialize_dependencies(self.dependencies),
+                    "artifact_roots": artifact_roots,
+                    "build_signature": signature,
+                },
+                statistics=finalize_result.statistics,
+                content_hash=content_hash,
             )
-        store.set_phase("finalizing")
-        finalize_result = self.finalize_manifest(
-            store.raw_rows(),
-            parent_rows=parent_rows,
-            build_context=context,
-            sandbox_registry=sandbox_registry,
-            seed_plan=seed_plan,
-        )
-        rows_with_keys = []
-        for row in finalize_result.rows:
-            keyed = dict(row)
-            keyed["__unique_key__"] = [keyed[field] for field in self.primary_unique_key()]
-            rows_with_keys.append(keyed)
-        store.set_phase("validating")
-        store.validate_payloads(staging_dir, verify_hash=True)
-        for position, parent in enumerate(parent_tables_list):
-            if parent.path is None or position >= len(dependency_records):
-                continue
-            parent_artifact = SQLiteArtifactStore(parent.path / "artifact.sqlite").artifact(
-                read_only=True
-            )
-            expected_hash = dependency_records[position].get("manifest_hash")
-            actual_hash = None if parent_artifact is None else parent_artifact.content_hash
-            if parent_artifact is None or parent_artifact.status != "completed":
-                raise ValueError(f"parent artifact is not completed: {parent.path}")
-            if expected_hash != actual_hash:
-                raise ValueError(f"parent artifact changed during build: {parent.path}")
-        content_hash = stable_hash(rows_with_keys)
-        store.set_phase("committing")
-        store.finalize(
-            rows=rows_with_keys,
-            metadata={
-                **finalize_result.metadata,
-                "dependencies": serialize_dependencies(self.dependencies),
-                "artifact_roots": artifact_roots,
-                "build_signature": signature,
-            },
-            statistics=finalize_result.statistics,
-            content_hash=content_hash,
-        )
-        store.checkpoint_and_close()
+            store.checkpoint_and_close()
+            if stage_store is not None:
+                stage_store.close()
+                if not cfg.keep_stages:
+                    for suffix in ("", "-wal", "-shm"):
+                        stage_path = staging_dir / f"stages.sqlite{suffix}"
+                        if stage_path.exists():
+                            stage_path.unlink()
+        except BaseException:
+            if stage_store is not None:
+                stage_store.close()
+            raise
         os.replace(staging_dir, out_dir)
         return BuildResult(
             table=LazyTable.open(out_dir, sandbox_registry=sandbox_registry),
@@ -448,6 +579,136 @@ class ArtifactBuilderBase:
             failed_source_rows=0,
             node_stats=node_stats,
         )
+
+
+def parent_table_map(
+    dependencies: list[ArtifactDependency], parent_tables: list[LazyTable]
+) -> dict[str, LazyTable]:
+    """부모 표를 이름으로: ``"이름@판"``과, 이름이 하나뿐이면 ``"이름"``."""
+
+    out: dict[str, LazyTable] = {}
+    for position, table in enumerate(parent_tables):
+        if position < len(dependencies):
+            dependency = dependencies[position]
+            full = f"{dependency.artifact_name}@{dependency.artifact_version}"
+        elif table.artifact_id is not None:
+            full = table.artifact_id.text
+        else:
+            continue
+        out.setdefault(full, table)
+    names: dict[str, set[str]] = {}
+    for full in list(out):
+        names.setdefault(full.rsplit("@", 1)[0], set()).add(full)
+    for name, fulls in names.items():
+        if len(fulls) == 1:
+            out.setdefault(name, out[next(iter(fulls))])
+    return out
+
+
+def _stage_zero_units(
+    first: Node, prepared_rows: list[Any], store: SQLiteArtifactStore
+) -> tuple[list[Group], Callable[[int], tuple[int, ...]]]:
+    """첫 단계 단위: 묶음이 없으면 원본 행 하나씩, 있으면 원본 행 메타 값으로 실행 전에 묶는다."""
+
+    if first.groups is None:
+        units = [
+            Group.single(row, member_id=f"s{index}", sources=(index,))
+            for index, row in enumerate(prepared_rows)
+        ]
+        return units, lambda index: (index,)
+    metas = [
+        ItemMeta(id=f"s{index}", values=meta_values(row), sources=(index,))
+        for index, row in enumerate(prepared_rows)
+    ]
+    planned, plan_hash = plan_groups(first.groups, metas)
+    store.check_plan(0, plan_hash, len(planned))
+    units = [
+        Group(
+            [prepared_rows[int(member_id[1:])] for member_id in group.member_ids],
+            key=group.key,
+            member_ids=group.member_ids,
+            sources=group.sources,
+        )
+        for group in planned
+    ]
+    return units, lambda index: planned[index].sources
+
+
+def _run_barrier_stage(
+    builder: ArtifactBuilderBase,
+    stage_idx: int,
+    offset: int,
+    stage_nodes: list[Node],
+    units: Sequence[Group],
+    unit_sources: Callable[[int], tuple[int, ...]],
+    *,
+    stage_store: StageStore,
+    policy: BuildPolicy,
+    parent_rows: list[ParsedRow],
+    parents: Mapping[str, LazyTable],
+    build_context: BuildContextView,
+    sandbox_registry: SandboxRegistry | None,
+    seed_plan: SeedPlan | None,
+    executor_config: ExecutorConfig,
+) -> dict[str, dict[str, Any]]:
+    """뒤에 묶음이 오는 단계: 결과를 단위마다 디스크에 쓴다. 실패한 단위가 있으면 빌드를 멈춘다.
+
+    뒤 단계 묶음은 이 단계 결과 전체를 봐야 정해지므로, 일부 단위가 빠진 채로 묶지 않는다.
+    """
+
+    completed = stage_store.completed_units(stage_idx)
+    if policy.retry_failed:
+        stage_store.clear_failed(stage_idx)
+    buffers: dict[int, list[dict[str, Any]]] = {}
+
+    with tqdm(
+        total=len(units),
+        initial=len(completed),
+        desc=f"stage{stage_idx}:{stage_nodes[0].name}",
+        unit="unit",
+    ) as progress:
+
+        def emit(unit_idx: int, output_idx: int, row: dict[str, Any]) -> None:
+            buffers.setdefault(unit_idx, []).append(row)
+
+        def finish(unit_idx: int) -> None:
+            sources = unit_sources(unit_idx)
+            rows = buffers.pop(unit_idx, [])
+            stage_store.commit_unit(
+                stage_idx, unit_idx, [(meta_values(row), sources, row) for row in rows]
+            )
+            progress.update(1)
+
+        def fail(unit_idx: int, error: BaseException) -> None:
+            buffers.pop(unit_idx, None)
+            stage_store.mark_failed(stage_idx, unit_idx, error)
+            progress.update(1)
+
+        stats, failures = run_pipeline(
+            builder,
+            stage_nodes,
+            units,
+            parent_rows=parent_rows,
+            build_context=build_context,
+            sandbox_registry=sandbox_registry,
+            seed_plan=seed_plan,
+            cpu_workers=int(executor_config.row_workers),
+            cpu_executor=executor_config.row_executor,
+            skip_source_indices=completed,
+            emit=emit,
+            finish_source=finish,
+            fail_source=fail,
+            node_offset=offset,
+            parents=parents,
+        )
+    if failures:
+        first = min(failures)
+        raise RuntimeError(
+            f"stage {stage_idx}({stage_nodes[0].name}): {len(failures)} units failed; first is unit "
+            f"{first}: {type(failures[first]).__name__}: {failures[first]}. "
+            "뒤 단계 묶음은 이 단계 결과가 모두 있어야 정해지므로 빌드를 멈춤(다시 실행하면 실패 단위만 다시 함)"
+        )
+    return stats
 
 
 def _process_worker_transform_row(

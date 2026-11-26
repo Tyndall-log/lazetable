@@ -557,6 +557,57 @@ class LazyTable:
             root_overrides=root_overrides,
         )
 
+    def join(
+        self,
+        other: "LazyTable",
+        *,
+        on: str | tuple[str, ...] | list[str] | None = None,
+        left_on: str | tuple[str, ...] | list[str] | None = None,
+        right_on: str | tuple[str, ...] | list[str] | None = None,
+        prefix: str = "",
+        rename: Mapping[str, str] | None = None,
+        how: Literal["strict", "inner", "left"] = "strict",
+    ) -> "LazyTable":
+        """``other``의 열을 키로 붙인 새 표(이 표의 행 순서 유지).
+
+        규칙은 ``ArtifactJoin``과 같다. ``other``의 키 열과 ``__`` 내부 열은 붙지 않고, 나머지는
+        ``rename`` 또는 ``prefix``로 이름을 바꿔 붙는다. 이름이 겹치면 ``ColumnConflictError``.
+        payload는 각자 열 때의 경로 규칙으로 그대로 해석된다.
+        """
+
+        from .artifacts import ArtifactJoin, join_arrow_tables
+
+        def keys(value: str | tuple[str, ...] | list[str] | None) -> tuple[str, ...]:
+            if value is None:
+                return ()
+            return (value,) if isinstance(value, str) else tuple(value)
+
+        if on is not None and (left_on is not None or right_on is not None):
+            raise ValueError("on과 left_on/right_on은 함께 쓸 수 없음")
+        left, right = (keys(on), keys(on)) if on is not None else (keys(left_on), keys(right_on))
+        spec = ArtifactJoin(
+            child_on=left, parent_on=right, prefix=prefix, rename=dict(rename or {}), how=how
+        )
+        joined = join_arrow_tables(self._table, other.table, spec)
+        roots = {**other.resolver_context.artifact_roots, **self._resolver_context.artifact_roots}
+        meta = self.meta
+        meta["artifact_roots"] = roots
+        return LazyTable.from_table(
+            joined,
+            artifact_id=self._artifact_id,
+            path=self._path,
+            meta=meta,
+            payload_manager=self._payload_manager,
+            row_view_manager=self._row_view_manager,
+            resolver_context=ResolverContext(
+                self._resolver_context.sandbox_registry or other.resolver_context.sandbox_registry,
+                roots,
+                self._resolver_context.path_resolution,
+                self._resolver_context.root_overrides,
+            ),
+            context=self._context,
+        )
+
     def count_rows(self) -> int:
         return self._table.num_rows
 
