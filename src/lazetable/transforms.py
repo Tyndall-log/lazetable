@@ -374,7 +374,7 @@ class ArtifactBuilderBase:
         stage_stats: dict[str, dict[str, Any]] = {}
         if nodes is None:
             final_units: Sequence[Any] = prepared_rows
-            unit_sources: Callable[[int], tuple[int, ...]] = lambda index: (index,)
+            unit_sources: Callable[[int], tuple[int, ...]] = _own_index
         else:
             final_units, unit_sources = _stage_zero_units(nodes[0], prepared_rows, store)
             if len(stages) > 1:
@@ -603,6 +603,10 @@ def parent_table_map(
         if len(fulls) == 1:
             out.setdefault(name, out[next(iter(fulls))])
     return out
+
+
+def _own_index(index: int) -> tuple[int, ...]:
+    return (index,)
 
 
 def _stage_zero_units(
